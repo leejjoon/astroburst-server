@@ -30,9 +30,10 @@ pub async fn save_api_key(key: String, service: Option<String>) -> Result<serde_
 }
 
 #[tauri::command]
-pub async fn get_api_key() -> Result<serde_json::Value, String> {
+pub async fn get_api_key(service: Option<String>) -> Result<serde_json::Value, String> {
     blocking_cmd!({
-        let key = config::load_api_key("astrometry")?;
-        Ok(json!({ RES_KEY: key }))
+        let svc = service.as_deref().unwrap_or("astrometry");
+        let key = config::load_api_key(svc)?;
+        Ok(json!({ RES_KEY: key, RES_SERVICE: svc }))
     })
 }
