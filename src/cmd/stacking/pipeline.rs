@@ -5,7 +5,7 @@ use crate::core::imaging::calibration_pipeline::{
     run_batch_pipeline, BatchPipelineConfig, BatchStackConfig,
     CalibrationMasters, ChannelInput,
 };
-use crate::domain::calibration::{
+use crate::core::stacking::calibration::{
     create_master_bias, create_master_dark, create_master_flat, load_fits_image,
 };
 use crate::types::constants::{

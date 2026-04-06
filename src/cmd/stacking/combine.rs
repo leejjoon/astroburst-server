@@ -2,8 +2,8 @@ use serde_json::json;
 
 use crate::cmd::common::{blocking_cmd, render_asinh_and_save, resolve_output_dir};
 use crate::core::imaging::stats::compute_image_stats;
-use crate::domain::calibration::calibrate_from_paths;
-use crate::domain::stacking::stack_from_paths;
+use crate::core::stacking::calibration::calibrate_from_paths;
+use crate::core::stacking::calibration::stack_from_paths;
 use crate::infra::progress::ProgressHandle;
 use crate::types::constants::{
     EVENT_CALIBRATE_PROGRESS, EVENT_STACK_PROGRESS, STAGE_RENDER, STAGE_SAVE,

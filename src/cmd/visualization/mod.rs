@@ -1,9 +1,12 @@
 use serde_json::json;
 
 use crate::cmd::common::{blocking_cmd, load_cached, resolve_output_dir, save_preview_png};
+use crate::cmd::helpers;
 use crate::core::imaging::stf::{apply_stf, apply_stf_f32, auto_stf, AutoStfConfig, StfParams};
 use crate::infra::render::tiles;
-use crate::types::constants::{RES_HIGHLIGHT, RES_MIDTONE, RES_PNG_PATH, RES_SHADOW};
+use crate::types::constants::{
+    RES_HIGHLIGHT, RES_MIDTONE, RES_PNG_PATH, RES_SHADOW,
+};
 
 #[tauri::command]
 pub async fn apply_stf_render(
@@ -62,6 +65,32 @@ pub async fn generate_tiles(
         };
 
         let result = tiles::generate_tile_pyramid(&normalized, &output_dir, &params)?;
+        Ok(serde_json::to_value(&result).unwrap_or(json!({})))
+    })
+}
+
+#[tauri::command]
+pub async fn generate_tiles_rgb(
+    output_dir: String,
+    tile_size: u32,
+) -> Result<serde_json::Value, String> {
+    blocking_cmd!({
+        resolve_output_dir(&output_dir)?;
+
+        let (entry_r, entry_g, entry_b) = helpers::load_composite_rgb()
+            .map_err(|_| anyhow::anyhow!("RGB composite not available. Run Compose RGB first."))?;
+
+        let params = tiles::TileParams {
+            tile_size: tile_size as usize,
+        };
+
+        let result = tiles::generate_tile_pyramid_rgb(
+            entry_r.arr(),
+            entry_g.arr(),
+            entry_b.arr(),
+            &output_dir,
+            &params,
+        )?;
         Ok(serde_json::to_value(&result).unwrap_or(json!({})))
     })
 }

@@ -1,9 +1,7 @@
 use serde_json::json;
 
-use crate::cmd::common::{blocking_cmd, load_from_cache_or_disk, resolve_output_dir, save_preview_png};
+use crate::cmd::common::{blocking_cmd, load_from_cache_or_disk, resolve_output_dir, save_preview_png, auto_stretch_preview};
 use crate::core::imaging::background::{extract_background, BackgroundConfig, BackgroundMode};
-use crate::core::imaging::stats::compute_image_stats;
-use crate::core::imaging::stf::{auto_stf, apply_stf, AutoStfConfig};
 use crate::infra::progress::ProgressHandle;
 use crate::types::constants::{
     MODE_DIVIDE, PROGRESS_EVENT, PROGRESS_STEPS, DEFAULT_STEM,
@@ -46,13 +44,8 @@ pub async fn extract_background_cmd(
 
         let bg_result = extract_background(entry.arr(), &config, Some(&progress_clone))?;
 
-        let stats = compute_image_stats(&bg_result.corrected);
-        let stf_params = auto_stf(&stats, &AutoStfConfig::default());
-        let rendered = apply_stf(&bg_result.corrected, &stf_params, &stats);
-
-        let model_stats = compute_image_stats(&bg_result.model);
-        let model_stf = auto_stf(&model_stats, &AutoStfConfig::default());
-        let model_rendered = apply_stf(&bg_result.model, &model_stf, &model_stats);
+        let rendered = auto_stretch_preview(&bg_result.corrected);
+        let model_rendered = auto_stretch_preview(&bg_result.model);
 
         let stem = std::path::Path::new(&path)
             .file_stem()

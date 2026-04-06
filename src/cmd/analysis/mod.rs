@@ -120,3 +120,45 @@ pub async fn detect_stars(
         Ok(val)
     })
 }
+
+#[tauri::command]
+pub async fn detect_stars_composite(
+    sigma: f64,
+    max_stars: usize,
+) -> Result<serde_json::Value, String> {
+    blocking_cmd!({
+        let t0 = Instant::now();
+        let (er, eg, eb) = crate::cmd::helpers::load_composite_rgb()
+            .map_err(|_| anyhow::anyhow!("RGB composite not available. Run Compose RGB first."))?;
+
+        let r = er.arr();
+        let g = eg.arr();
+        let b = eb.arr();
+        let (rows, cols) = r.dim();
+
+        let r_s = r.as_slice().unwrap();
+        let g_s = g.as_slice().unwrap();
+        let b_s = b.as_slice().unwrap();
+
+        let n = rows * cols;
+        let lum_vec: Vec<f32> = if n > PAR_THRESHOLD {
+            (0..n).into_par_iter()
+                .map(|i| r_s[i] * 0.2126 + g_s[i] * 0.7152 + b_s[i] * 0.0722)
+                .collect()
+        } else {
+            (0..n)
+                .map(|i| r_s[i] * 0.2126 + g_s[i] * 0.7152 + b_s[i] * 0.0722)
+                .collect()
+        };
+        let lum = ndarray::Array2::from_shape_vec((rows, cols), lum_vec)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        let mut result = detect_stars_core(&lum, sigma);
+        result.stars.truncate(max_stars);
+        let mut val = serde_json::to_value(&result)?;
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(RES_ELAPSED_MS.to_string(), json!(t0.elapsed().as_millis() as u64));
+        }
+        Ok(val)
+    })
+}
