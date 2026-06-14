@@ -9,7 +9,7 @@ Start the server first:
 
 ```bash
 cd src-tauri
-cargo run --no-default-features --features server,astrometry-net,asdf-full,vizier
+cargo run --bin astroburst-server --no-default-features --features server,astrometry-net,asdf-full,vizier
 # Listening on 127.0.0.1:8080
 ```
 

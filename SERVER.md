@@ -18,7 +18,7 @@ The binary is at `target/release/astroburst-server`.
 For development (faster compile, no optimisations):
 
 ```bash
-cargo run \
+cargo run --bin astroburst-server \
   --no-default-features \
   --features server,astrometry-net,asdf-full,vizier
 ```

@@ -47,7 +47,7 @@ cargo test --no-default-features --features server,astrometry-net,asdf-full,vizi
 Start the server in one terminal:
 
 ```bash
-cargo run --no-default-features --features server,astrometry-net,asdf-full,vizier
+cargo run --bin astroburst-server --no-default-features --features server,astrometry-net,asdf-full,vizier
 ```
 
 All examples below assume `BASE=http://localhost:8080`.
@@ -220,7 +220,7 @@ Verify env-var overrides work before deploying to a remote machine:
 
 ```bash
 # Tight limits — 3rd session must return 503
-ASTROBURST_SESSION_MAX=2 cargo run \
+ASTROBURST_SESSION_MAX=2 cargo run --bin astroburst-server \
   --no-default-features \
   --features server,astrometry-net,asdf-full,vizier &
 
@@ -236,7 +236,7 @@ kill %1
 Verify an invalid value falls back gracefully (warning on stderr, default used):
 
 ```bash
-ASTROBURST_SESSION_MAX=notanumber cargo run \
+ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
   --no-default-features \
   --features server,astrometry-net,asdf-full,vizier 2>&1 | head -5
 # WARN: ASTROBURST_SESSION_MAX="notanumber" is invalid ...; using default 8
