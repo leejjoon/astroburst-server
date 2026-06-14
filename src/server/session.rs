@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use tokio::sync::RwLock;
@@ -7,15 +7,10 @@ use uuid::Uuid;
 
 use astroburst_lib::infra::cache::ImageCache;
 
+use super::config::ServerConfig;
 use super::job::{Job, JobId};
-use super::state::MAX_SESSIONS;
 
 pub type SessionId = String;
-
-const SESSION_MAX_ENTRIES: usize = 32;
-const SESSION_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GB per session
-const SESSION_TTL: Duration = Duration::from_secs(15 * 60);
-const TTL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct Session {
     pub id: SessionId,
@@ -25,10 +20,10 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(id: SessionId) -> Arc<Self> {
+    pub fn new(id: SessionId, cfg: &ServerConfig) -> Arc<Self> {
         Arc::new(Self {
             id,
-            cache: Arc::new(ImageCache::new(SESSION_MAX_ENTRIES, SESSION_MAX_BYTES)),
+            cache: Arc::new(ImageCache::new(cfg.cache_max_entries, cfg.cache_max_bytes)),
             jobs: DashMap::new(),
             last_accessed: RwLock::new(Instant::now()),
         })
@@ -46,29 +41,36 @@ impl Session {
 
 pub struct SessionManager {
     sessions: Arc<DashMap<SessionId, Arc<Session>>>,
+    config: Arc<ServerConfig>,
 }
 
 impl SessionManager {
-    pub fn new(sessions: Arc<DashMap<SessionId, Arc<Session>>>) -> Self {
-        Self { sessions }
+    pub fn new(
+        sessions: Arc<DashMap<SessionId, Arc<Session>>>,
+        config: Arc<ServerConfig>,
+    ) -> Self {
+        Self { sessions, config }
     }
 
-    /// Create a new session, capped at MAX_SESSIONS. Returns None when full.
+    /// Create a new session, capped at `config.session_max`. Returns `None` when full.
     pub fn create(&self) -> Option<Arc<Session>> {
-        if self.sessions.len() >= MAX_SESSIONS {
+        if self.sessions.len() >= self.config.session_max {
             return None;
         }
         let id = Uuid::new_v4().to_string();
-        let session = Session::new(id.clone());
+        let session = Session::new(id.clone(), &self.config);
         self.sessions.insert(id, Arc::clone(&session));
         Some(session)
     }
 
-    /// Spawn the background task that evicts sessions idle past SESSION_TTL.
+    /// Spawn the background task that evicts sessions idle past `config.session_ttl`.
     /// Sessions with at least one Running job are always skipped.
-    pub fn start_ttl_cleaner(sessions: Arc<DashMap<SessionId, Arc<Session>>>) {
+    pub fn start_ttl_cleaner(
+        sessions: Arc<DashMap<SessionId, Arc<Session>>>,
+        config: Arc<ServerConfig>,
+    ) {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(TTL_SWEEP_INTERVAL);
+            let mut interval = tokio::time::interval(config.cleanup_interval);
             loop {
                 interval.tick().await;
                 let now = Instant::now();
@@ -79,7 +81,7 @@ impl SessionManager {
                         continue;
                     }
                     let last = *s.last_accessed.read().await;
-                    if now.duration_since(last) > SESSION_TTL {
+                    if now.duration_since(last) > config.session_ttl {
                         expired.push(entry.key().clone());
                     }
                 }

@@ -10,12 +10,15 @@ use crate::state::AppState;
 /// and a job registry; all other endpoints are scoped under
 /// `/sessions/:sid/`.
 ///
-/// Returns 503 when the server-wide session cap (MAX_SESSIONS = 8) is
-/// reached — caller should retry after existing sessions expire.
+/// Returns 503 when the server-wide session cap (`ASTROBURST_SESSION_MAX`,
+/// default 8) is reached — caller should retry after existing sessions expire.
 pub async fn create(State(state): State<AppState>) -> Result<(StatusCode, Json<Value>)> {
-    let session = state
-        .create_session()
-        .ok_or_else(|| AppError::ServiceUnavailable("session cap reached (max 8)".into()))?;
+    let session = state.create_session().ok_or_else(|| {
+        AppError::ServiceUnavailable(format!(
+            "session cap reached (max {})",
+            state.config.session_max
+        ))
+    })?;
 
     Ok((
         StatusCode::CREATED,

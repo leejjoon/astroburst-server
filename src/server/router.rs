@@ -1,5 +1,5 @@
 use axum::{
-    extract::Request,
+    extract::{Request, State},
     http::HeaderValue,
     middleware::{self, Next},
     response::Response,
@@ -7,6 +7,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
 use super::handlers::{io, jobs, pipeline, render, sessions, stacking};
@@ -38,8 +39,14 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn(request_id))
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+/// GET /health — PRD §7.3
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "sessions_active": state.sessions.len(),
+        "sessions_total": state.created_total.load(Ordering::Relaxed),
+    }))
 }
 
 /// Echo or mint an X-Request-Id header on every response.
