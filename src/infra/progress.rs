@@ -2,10 +2,22 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+#[cfg(feature = "tauri")]
 use tauri::Emitter;
 
 const MIN_EMIT_INTERVAL_MS: u128 = 50;
 
+#[derive(Clone, Serialize)]
+pub struct ProgressPayload {
+    pub current: u64,
+    pub total: u64,
+    pub percent: u32,
+    pub stage: String,
+}
+
+// Full Tauri-backed ProgressHandle — only compiled for the desktop build.
+#[cfg(feature = "tauri")]
 #[derive(Clone)]
 pub struct ProgressHandle {
     current: Arc<AtomicU64>,
@@ -16,14 +28,14 @@ pub struct ProgressHandle {
     last_emit: Arc<Mutex<Instant>>,
 }
 
-#[derive(Clone, Serialize)]
-pub struct ProgressPayload {
-    pub current: u64,
-    pub total: u64,
-    pub percent: u32,
-    pub stage: String,
-}
+// No-op stub — compiled for the headless server build.
+// Core functions accept Option<&ProgressHandle>; the server always passes None,
+// so this struct is never instantiated at runtime.
+#[cfg(not(feature = "tauri"))]
+#[derive(Clone)]
+pub struct ProgressHandle;
 
+#[cfg(feature = "tauri")]
 impl ProgressHandle {
     pub fn new(app: &tauri::AppHandle, event: &str, total: u64) -> Self {
         Self {
@@ -86,4 +98,14 @@ impl ProgressHandle {
             },
         );
     }
+}
+
+#[cfg(not(feature = "tauri"))]
+impl ProgressHandle {
+    pub fn is_cancelled(&self) -> bool {
+        false
+    }
+    pub fn tick_with_stage(&self, _stage: &str) {}
+    pub fn set_total(&self, _total: u64) {}
+    pub fn emit_complete(&self) {}
 }
