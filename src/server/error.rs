@@ -11,6 +11,7 @@ pub enum AppError {
     Conflict(String),
     TooManyRequests,
     BadRequest(String),
+    ServiceUnavailable(String),
     Internal(anyhow::Error),
 }
 
@@ -25,6 +26,7 @@ impl IntoResponse for AppError {
                 "job queue full (max 4 concurrent)".into(),
             ),
             AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, "bad_request", m),
+            AppError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable", m),
             AppError::Internal(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

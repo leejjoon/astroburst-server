@@ -9,12 +9,13 @@ use axum::{
 use serde_json::json;
 use uuid::Uuid;
 
-use super::handlers::{io, jobs, pipeline, render, stacking};
+use super::handlers::{io, jobs, pipeline, render, sessions, stacking};
 use super::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/sessions", routing::post(sessions::create))
         // T7 — FITS I/O
         .route("/sessions/:sid/fits/open",   routing::post(io::fits_open))
         .route("/sessions/:sid/fits/header", routing::post(io::fits_header))
