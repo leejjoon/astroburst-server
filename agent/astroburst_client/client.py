@@ -165,6 +165,7 @@ class Job:
             if response.status_code != 200:
                 body: Any = {}
                 try:
+                    await response.aread()
                     body = response.json()
                 except Exception:
                     pass
