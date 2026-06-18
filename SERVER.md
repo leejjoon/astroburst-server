@@ -301,11 +301,14 @@ Sigma-clip stack a list of FITS files.
   "sigma_low": 3.0,
   "sigma_high": 3.0,
   "max_iterations": 5,
-  "align": true
+  "align": true,
+  "weights": [1.0, 1.0, 0.5]
 }
 ```
 
 All fields except `paths` are optional. `result_slot` defaults to `"stacked"`.
+`weights` is an optional per-frame weight array (same length as `paths`); if the
+lengths differ it is silently ignored and uniform weighting is used.
 
 **Response `202`:**
 ```json
@@ -324,10 +327,13 @@ Drizzle-combine a list of FITS files.
   "scale": 2.0,
   "pixfrac": 0.7,
   "kernel": "lanczos3",
+  "sigma_low": 3.0,
+  "sigma_high": 3.0,
   "align": true
 }
 ```
 
+All fields except `paths` are optional. `result_slot` defaults to `"drizzled"`.
 `kernel` is one of: `"square"` (default), `"gaussian"`, `"lanczos3"`.
 
 **Response `202`:**
