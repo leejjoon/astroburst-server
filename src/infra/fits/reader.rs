@@ -500,6 +500,24 @@ pub fn extract_image_mmap(file: &File) -> Result<MmapImageResult> {
     })
 }
 
+/// Same HDU selection as `extract_image_mmap`, but skips `extract_image_from_hdu`
+/// (pixel decode/decompress) entirely -- for callers that only need the merged
+/// header (e.g. a WCS lookup driven by mouse movement, where re-decoding the
+/// whole image on every call would be far too slow).
+pub fn extract_header_mmap(file: &File) -> Result<HduHeader> {
+    let mmap = create_mmap(file)?;
+    let hdus = scan_all_hdus(&mmap)?;
+
+    if hdus.is_empty() {
+        bail!("No HDUs found in FITS file");
+    }
+
+    let selected_idx = select_best_image_hdu(&hdus)
+        .context("No 2D image block found in any HDU")?;
+
+    Ok(build_merged_header(&hdus, selected_idx))
+}
+
 pub fn extract_image_mmap_by_index(file: &File, hdu_index: usize) -> Result<MmapImageResult> {
     let mmap = create_mmap(file)?;
     let hdus = scan_all_hdus(&mmap)?;

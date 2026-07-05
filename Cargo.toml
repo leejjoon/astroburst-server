@@ -40,6 +40,7 @@ rand = "0.8"
 image = "0.25"
 rustfft = "6.2"
 num-complex = "0.4"
+wcs = "0.4"
 
 memmap2 = "0.9"
 flate2 = "1.0"
