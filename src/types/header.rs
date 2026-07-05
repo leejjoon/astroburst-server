@@ -71,7 +71,7 @@ impl HduHeader {
 
     pub fn padded_data_bytes(&self) -> usize {
         let raw = self.data_byte_count();
-        ((raw + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE
+        raw.div_ceil(BLOCK_SIZE) * BLOCK_SIZE
     }
 
     pub fn merge_with(&self, extension: &HduHeader) -> HduHeader {

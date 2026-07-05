@@ -70,10 +70,6 @@ struct BintableLayout {
     columns: HashMap<String, ColumnSpan>,
 }
 
-fn div_ceil(a: usize, b: usize) -> usize {
-    (a + b - 1) / b
-}
-
 fn tform_elem_bytes(type_code: char) -> Result<usize> {
     Ok(match type_code {
         'L' | 'B' | 'A' => 1,
@@ -146,7 +142,7 @@ fn build_bintable_layout(header: &HduHeader, data_start: usize) -> Result<Bintab
             }
             TformKind::Fixed { repeat, type_code } => {
                 let width = if type_code == 'X' {
-                    div_ceil(repeat, 8)
+                    repeat.div_ceil(8)
                 } else {
                     repeat * tform_elem_bytes(type_code)?
                 };
@@ -259,8 +255,8 @@ fn parse_tile_geometry(header: &HduHeader) -> Result<TileGeometry> {
         znaxis2,
         ztile1,
         ztile2,
-        tiles_x: div_ceil(znaxis1, ztile1),
-        tiles_y: div_ceil(znaxis2, ztile2),
+        tiles_x: znaxis1.div_ceil(ztile1),
+        tiles_y: znaxis2.div_ceil(ztile2),
         zbitpix,
     })
 }
@@ -439,9 +435,9 @@ pub fn decode_compressed_image(
     let zscale_col = layout.columns.get("ZSCALE").copied();
     let zzero_col = layout.columns.get("ZZERO").copied();
 
-    let tiles: Vec<Result<(usize, usize, usize, usize, Vec<f32>)>> = (0..n_tiles)
+    let tiles: Vec<Result<DecodedTile>> = (0..n_tiles)
         .into_par_iter()
-        .map(|row| -> Result<(usize, usize, usize, usize, Vec<f32>)> {
+        .map(|row| -> Result<DecodedTile> {
             let tx = row % geom.tiles_x;
             let ty = row / geom.tiles_x;
             let x0 = tx * geom.ztile1;
@@ -478,20 +474,28 @@ pub fn decode_compressed_image(
                 bail!("tile {row} decoded {} pixels, expected {nx}", pixels.len());
             }
 
-            Ok((x0, y0, tile_w, tile_h, pixels))
+            Ok(DecodedTile { x0, y0, w: tile_w, h: tile_h, pixels })
         })
         .collect();
 
     let mut image = Array2::<f32>::from_elem((geom.znaxis2, geom.znaxis1), f32::NAN);
     for tile in tiles {
-        let (x0, y0, tile_w, tile_h, pixels) = tile?;
-        for yy in 0..tile_h {
-            let row_offset = yy * tile_w;
-            for xx in 0..tile_w {
-                image[[y0 + yy, x0 + xx]] = pixels[row_offset + xx];
+        let tile = tile?;
+        for yy in 0..tile.h {
+            let row_offset = yy * tile.w;
+            for xx in 0..tile.w {
+                image[[tile.y0 + yy, tile.x0 + xx]] = tile.pixels[row_offset + xx];
             }
         }
     }
 
     Ok(image)
+}
+
+struct DecodedTile {
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    pixels: Vec<f32>,
 }

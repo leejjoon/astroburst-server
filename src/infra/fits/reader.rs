@@ -306,7 +306,7 @@ fn scan_all_hdus(mmap: &[u8]) -> Result<Vec<ScannedHdu>> {
         let extver = h.get_i64("EXTVER");
         let is_image_hdu = h
             .get("XTENSION")
-            .map_or(true, |x| x.trim().eq_ignore_ascii_case("IMAGE"));
+            .is_none_or(|x| x.trim().eq_ignore_ascii_case("IMAGE"));
         let is_compressed = compress::is_compressed_image_hdu(h);
 
         // For a compressed-image BINTABLE, the Z-prefixed keywords (ZNAXIS,
