@@ -293,6 +293,28 @@ curl -s -X POST http://localhost:8080/v2/sessions/$SID/wcs/separation \
 Calling `pix2sky` / `sky2pix` (or a `pixel` separation) against an image with no
 usable WCS header returns `400 wcs_required` — never a panic or 500.
 
+### Pixel point-query (issue #7)
+
+The "is that white speck real or a hot pixel?" sanity check: value at a pixel,
+plus min/max/mean over the surrounding `box`×`box` neighborhood, and the sky
+coordinate when the image carries a WCS. A real source has elevated neighbors;
+a single hot pixel does not.
+
+```bash
+# Value + 5×5 neighborhood stats + sky coordinate.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/pixel \
+  -H 'content-type: application/json' \
+  -d '{"x":3,"y":3,"box":5}' | jq .
+# => { "ref":"img_0", "x":3, "y":3, "value":..., "box":5,
+#      "neighborhood": {"min":.., "max":.., "mean":.., "n_pixels":25, "n_nan":0},
+#      "sky": {"ra":150.0, "dec":2.0} }
+```
+
+The `box` window is clipped to the image at edges (`n_pixels` reports how many
+in-bounds pixels were counted), NaNs are skipped from the stats and counted in
+`n_nan`, and `sky` is `null` when the image has no usable WCS (not an error).
+An out-of-bounds `(x, y)` returns `400 pixel_out_of_bounds` — never a panic.
+
 ---
 
 ## Testing configuration

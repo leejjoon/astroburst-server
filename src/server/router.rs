@@ -51,6 +51,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/wcs/pix2sky", routing::post(v2::wcs::pix2sky))
         .route("/v2/sessions/:sid/wcs/sky2pix", routing::post(v2::wcs::sky2pix))
         .route("/v2/sessions/:sid/wcs/separation", routing::post(v2::wcs::separation))
+        // ── v2 API: pixel point-query (issue #7) ─────────────────────────────
+        .route("/v2/sessions/:sid/pixel", routing::post(v2::pixel::pixel))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
 }

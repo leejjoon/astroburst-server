@@ -7,6 +7,7 @@
 //! (cutout, stats, render, ...) build on.
 
 pub mod images;
+pub mod pixel;
 // `region` is shared plumbing consumed by later slices (cutout, stats, ...);
 // its public surface is exercised by unit tests but not yet by a live handler.
 #[allow(dead_code)]

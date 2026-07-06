@@ -737,3 +737,98 @@ async fn v2_wcs_without_header_returns_wcs_required() {
     let json = body_json(resp).await;
     assert_eq!(json["error"]["code"], "wcs_required");
 }
+
+// ── pixel point-query (issue #7) ─────────────────────────────────────────────
+//
+// The `ramp` fixture fills pixel (x=col, y=row) with value `row*w + col`, so on
+// an 8×8 image the reference pixel (3,3) holds 3*8+3 = 27. Its 5×5 neighborhood
+// spans cols/rows [1,5]: min = 1*8+1 = 9, max = 5*8+5 = 45, mean = 27 (the ramp
+// is symmetric about the centre).
+
+#[tokio::test]
+async fn v2_pixel_value_and_box_stats_and_sky() {
+    let (state, _dir) = seed_wcs_session("s-px").await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-px/pixel",
+        r#"{"x":3,"y":3,"box":5}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    assert!((json["value"].as_f64().unwrap() - 27.0).abs() < 1e-6);
+    let nb = &json["neighborhood"];
+    assert!((nb["min"].as_f64().unwrap() - 9.0).abs() < 1e-6);
+    assert!((nb["max"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+    assert!((nb["mean"].as_f64().unwrap() - 27.0).abs() < 1e-6);
+    assert_eq!(nb["n_pixels"], 25);
+    assert_eq!(nb["n_nan"], 0);
+
+    // WCS present → the reference pixel maps to CRVAL.
+    assert!((json["sky"]["ra"].as_f64().unwrap() - 150.0).abs() < 1e-6);
+    assert!((json["sky"]["dec"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn v2_pixel_box_clipped_at_image_edge() {
+    let (state, _dir) = seed_wcs_session("s-px-edge").await;
+
+    // Corner pixel (0,0): a 5×5 box clips to the 3×3 in-bounds quadrant
+    // cols/rows [0,2]. min = 0, max = 2*8+2 = 18, 9 pixels counted.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-px-edge/pixel",
+        r#"{"x":0,"y":0,"box":5}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!((json["value"].as_f64().unwrap() - 0.0).abs() < 1e-6);
+    assert_eq!(json["neighborhood"]["n_pixels"], 9);
+    assert!((json["neighborhood"]["max"].as_f64().unwrap() - 18.0).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn v2_pixel_without_wcs_omits_sky() {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("nowcs.fits");
+    v2_fixtures::write_no_wcs_fits(&fits, 8, 8);
+
+    let state = AppState::new(cfg());
+    seed_session(&state, "s-px-nowcs");
+    post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-px-nowcs/open",
+        &format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap()),
+    )
+    .await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-px-nowcs/pixel",
+        r#"{"x":2,"y":1,"box":3}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    // Value/stats still computed; sky is null rather than an error.
+    assert!((json["value"].as_f64().unwrap() - 10.0).abs() < 1e-6); // 1*8 + 2
+    assert!(json["sky"].is_null());
+}
+
+#[tokio::test]
+async fn v2_pixel_out_of_bounds_errors_not_panics() {
+    let (state, _dir) = seed_wcs_session("s-px-oob").await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-px-oob/pixel",
+        r#"{"x":100,"y":100,"box":5}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "pixel_out_of_bounds");
+}
