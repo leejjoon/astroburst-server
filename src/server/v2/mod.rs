@@ -7,9 +7,11 @@
 //! (cutout, stats, render, ...) build on.
 
 pub mod images;
-// `region` is shared plumbing consumed by later slices (cutout, stats, ...);
-// its public surface is exercised by unit tests but not yet by a live handler.
+// `region` is shared plumbing; the stats slice (issue #8) is its first live
+// consumer, and the cutout/render slices will follow. Some helpers remain
+// exercised only by unit tests until then.
 #[allow(dead_code)]
 pub mod region;
 pub mod sessions;
+pub mod stats;
 pub mod wcs;
