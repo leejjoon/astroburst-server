@@ -6,6 +6,7 @@
 //! lifecycle handlers and the shared [`region`] resolver that later slices
 //! (cutout, stats, render, ...) build on.
 
+pub mod bin;
 pub mod cutout;
 pub mod images;
 pub mod inspect;
