@@ -86,7 +86,7 @@ fn stats_json(s: &ImageStats) -> Value {
 
 /// Register a freshly-loaded `entry` under `image_ref`: record its metadata and
 /// make it the session's active ref. Returns the JSON body shared by open/hdu.
-fn register_and_respond(
+pub(crate) fn register_and_respond(
     session: &Session,
     image_ref: String,
     source: Option<String>,

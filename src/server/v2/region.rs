@@ -32,7 +32,7 @@ pub enum SkySize {
 
 impl SkySize {
     /// Returns `(width_arcmin, height_arcmin)`.
-    fn wh(&self) -> (f64, f64) {
+    pub(crate) fn wh(&self) -> (f64, f64) {
         match self {
             SkySize::Square(s) => (*s, *s),
             SkySize::Rect([w, h]) => (*w, *h),
