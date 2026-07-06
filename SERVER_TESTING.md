@@ -261,6 +261,38 @@ slice's `POST .../cutout` with a `sky` region against such an image will return
 `400 region_out_of_bounds` (with a `hint` naming the image extent) unless
 `clip: true` is passed.
 
+### WCS coordinate transforms (issue #3)
+
+All three run against an image ref (the request's optional `ref`, else the
+session's active ref) and are batch-capable. `on_image` compares the pixel
+coordinates against the image's NAXIS1/NAXIS2 extent.
+
+```bash
+# Pixel -> sky. Each result carries {x, y, ra, dec, on_image}.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/wcs/pix2sky \
+  -H 'content-type: application/json' \
+  -d '{"points": [[3,3], [100,100]]}' | jq '.results'
+
+# Sky -> pixel (round-trips the above within float tolerance).
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/wcs/sky2pix \
+  -H 'content-type: application/json' \
+  -d '{"points": [[150.0, 2.0]]}' | jq '.results'
+
+# Angular separation — two sky points (no WCS needed)...
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/wcs/separation \
+  -H 'content-type: application/json' \
+  -d '{"type":"sky","a":[150.0,2.0],"b":[150.0,3.0]}' | jq .
+# => { "separation_deg": 1.0, "separation_arcmin": 60.0, "separation_arcsec": 3600.0 }
+
+# ...or two pixel points, resolved to sky via the image's WCS first.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/wcs/separation \
+  -H 'content-type: application/json' \
+  -d '{"type":"pixel","a":[3,3],"b":[3,4]}' | jq .
+```
+
+Calling `pix2sky` / `sky2pix` (or a `pixel` separation) against an image with no
+usable WCS header returns `400 wcs_required` — never a panic or 500.
+
 ---
 
 ## Testing configuration
@@ -307,3 +339,6 @@ ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
 | `POST /v2/sessions/:sid/hdu` before any `open` | `400 bad_request` (no active image) |
 | `resolve_region` on an over-large region, `clip` unset | `400 region_out_of_bounds` with a `hint` naming the image extent |
 | `resolve_region` on a `sky` region against a WCS-less image | `400 wcs_required` |
+| `POST /v2/sessions/:sid/wcs/pix2sky` against a WCS-less image | `400 wcs_required` |
+| `POST /v2/sessions/:sid/wcs/{pix2sky,sky2pix}` before any `open` | `400 bad_request` (no active image) |
+| `POST /v2/sessions/:sid/wcs/pix2sky` with a `ref` not in the session | `404 not_found` |

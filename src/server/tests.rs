@@ -327,6 +327,22 @@ mod v2_fixtures {
         std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
     }
 
+    /// A single-HDU FITS image (w×h) with NO WCS keywords at all — used to
+    /// exercise the `wcs_required` error path. (A MEF extension can't stand in:
+    /// the reader merges the primary's WCS cards into any selected extension.)
+    pub fn write_no_wcs_fits(path: &std::path::Path, w: usize, h: usize) {
+        let cards: Vec<(&str, String)> = vec![
+            ("SIMPLE", "T".into()),
+            ("BITPIX", "-32".into()),
+            ("NAXIS", "2".into()),
+            ("NAXIS1", w.to_string()),
+            ("NAXIS2", h.to_string()),
+        ];
+        let mut buf = header_block(&cards);
+        buf.extend_from_slice(&data_block(&ramp(w, h)));
+        std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
+    }
+
     /// A 2-HDU MEF: primary (w0×h0, with WCS) + one IMAGE extension
     /// (w1×h1, EXTNAME=WEIGHT, no WCS). The two HDUs have different dims so a
     /// switch is observable.
@@ -591,4 +607,133 @@ async fn v2_keepalive_ok_and_status_reports_active_ref() {
     let json = body_json(resp).await;
     assert_eq!(json["active_ref"], "img_0");
     assert_eq!(json["image_count"], 1);
+}
+
+// ── v2 API: WCS coordinate transforms (issue #3) ─────────────────────────────
+
+/// Open the shared 8×8 TAN-WCS fixture into a fresh session and return the
+/// (state, session-id) pair so a follow-up request can hit its WCS routes.
+///
+/// The fixture's WCS puts CRPIX at (4,4) 1-based → pixel (3,3) 0-based maps
+/// exactly to CRVAL = (150.0, 2.0), with a 1e-4 deg/px scale.
+async fn seed_wcs_session(id: &str) -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("wcs.fits");
+    v2_fixtures::write_wcs_fits(&fits, 8, 8);
+
+    let state = AppState::new(cfg());
+    seed_session(&state, id);
+    post_json(
+        build_router(state.clone()),
+        &format!("/v2/sessions/{id}/open"),
+        &format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap()),
+    )
+    .await;
+    (state, dir)
+}
+
+#[tokio::test]
+async fn v2_pix2sky_converts_batch_and_reports_on_image() {
+    let (state, _dir) = seed_wcs_session("s-p2s").await;
+
+    // (3,3) is the reference pixel → CRVAL exactly; (100,100) is off the 8×8 image.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-p2s/wcs/pix2sky",
+        r#"{"points":[[3,3],[100,100]]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["count"], 2);
+
+    let r0 = &json["results"][0];
+    assert!((r0["ra"].as_f64().unwrap() - 150.0).abs() < 1e-6);
+    assert!((r0["dec"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+    assert_eq!(r0["on_image"], true);
+
+    let r1 = &json["results"][1];
+    assert_eq!(r1["on_image"], false);
+}
+
+#[tokio::test]
+async fn v2_sky2pix_round_trips_within_tolerance() {
+    let (state, _dir) = seed_wcs_session("s-s2p").await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-s2p/wcs/sky2pix",
+        r#"{"points":[[150.0,2.0]]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let r0 = &json["results"][0];
+    // CRVAL projects back to the reference pixel (3,3), which is on the image.
+    assert!((r0["x"].as_f64().unwrap() - 3.0).abs() < 1e-6);
+    assert!((r0["y"].as_f64().unwrap() - 3.0).abs() < 1e-6);
+    assert_eq!(r0["on_image"], true);
+}
+
+#[tokio::test]
+async fn v2_separation_sky_matches_reference() {
+    let (state, _dir) = seed_wcs_session("s-sep-sky").await;
+
+    // 1 degree apart in dec at the same RA → exactly 3600 arcsec.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-sep-sky/wcs/separation",
+        r#"{"type":"sky","a":[150.0,2.0],"b":[150.0,3.0]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!((json["separation_deg"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert!((json["separation_arcsec"].as_f64().unwrap() - 3600.0).abs() < 1e-4);
+}
+
+#[tokio::test]
+async fn v2_separation_pixel_uses_wcs() {
+    let (state, _dir) = seed_wcs_session("s-sep-pix").await;
+
+    // Pixels (3,3) and (3,4) differ by one row → CD2_2 = 1e-4 deg = 0.36 arcsec.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-sep-pix/wcs/separation",
+        r#"{"type":"pixel","a":[3,3],"b":[3,4]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!((json["separation_arcsec"].as_f64().unwrap() - 0.36).abs() < 1e-3);
+    // Pixel separation echoes the resolved sky coords and the ref.
+    assert_eq!(json["ref"], "img_0");
+    assert!(json["a_sky"].is_array());
+}
+
+#[tokio::test]
+async fn v2_wcs_without_header_returns_wcs_required() {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("nowcs.fits");
+    v2_fixtures::write_no_wcs_fits(&fits, 8, 8);
+
+    let state = AppState::new(cfg());
+    seed_session(&state, "s-nowcs");
+    post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-nowcs/open",
+        &format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap()),
+    )
+    .await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-nowcs/wcs/pix2sky",
+        r#"{"points":[[1,1]]}"#,
+    )
+    .await;
+    // A clear, distinct error — not a panic or 500.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "wcs_required");
 }

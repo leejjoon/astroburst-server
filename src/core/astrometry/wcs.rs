@@ -499,6 +499,40 @@ impl WcsTransform {
                 .collect()
         }
     }
+
+    /// Sky-to-pixel over a batch of `(ra, dec)` degree pairs, mirroring
+    /// [`Self::pixel_to_world_batch`]: rayon-parallel above 1024 points, serial
+    /// below. Each output is the 0-based `(x, y)` from [`Self::world_to_pixel`].
+    pub fn world_to_pixel_batch(&self, coords: &[(f64, f64)]) -> Vec<(f64, f64)> {
+        if coords.len() > 1024 {
+            coords
+                .par_iter()
+                .map(|&(ra, dec)| self.world_to_pixel(ra, dec))
+                .collect()
+        } else {
+            coords
+                .iter()
+                .map(|&(ra, dec)| self.world_to_pixel(ra, dec))
+                .collect()
+        }
+    }
+}
+
+/// Great-circle angular separation between two sky points, in degrees.
+///
+/// Uses the haversine form, which stays numerically well-conditioned for the
+/// small separations dominating image-scale work (the plain spherical law of
+/// cosines loses precision there). Inputs and output are all in degrees.
+pub fn angular_separation(ra1: f64, dec1: f64, ra2: f64, dec2: f64) -> f64 {
+    let ra1 = ra1.to_radians();
+    let dec1 = dec1.to_radians();
+    let ra2 = ra2.to_radians();
+    let dec2 = dec2.to_radians();
+    let d_ra = ra2 - ra1;
+    let d_dec = dec2 - dec1;
+    let a =
+        (d_dec / 2.0).sin().powi(2) + dec1.cos() * dec2.cos() * (d_ra / 2.0).sin().powi(2);
+    (2.0 * a.sqrt().clamp(-1.0, 1.0).asin()).to_degrees()
 }
 
 #[cfg(test)]
@@ -563,6 +597,67 @@ mod tests {
         let (px, py) = wcs.world_to_pixel(coord.ra, coord.dec);
         assert!((px - 150.0).abs() < 1e-3);
         assert!((py - 199.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_world_to_pixel_batch_matches_single() {
+        let h = make_header(&[
+            ("NAXIS1", "512"),
+            ("NAXIS2", "512"),
+            ("CRPIX1", "256"),
+            ("CRPIX2", "256"),
+            ("CRVAL1", "10.684"),
+            ("CRVAL2", "41.269"),
+            ("CDELT1", "-0.0003"),
+            ("CDELT2", "0.0003"),
+            ("CTYPE1", "RA---TAN"),
+            ("CTYPE2", "DEC--TAN"),
+        ]);
+        let wcs = WcsTransform::from_header(&h).unwrap();
+
+        // Round-trip a spread of pixels through pixel->world, then batch back.
+        let pixels = [(0.0, 0.0), (100.0, 300.0), (255.0, 255.0), (511.0, 40.0)];
+        let sky: Vec<(f64, f64)> = pixels
+            .iter()
+            .map(|&(x, y)| {
+                let c = wcs.pixel_to_world(x, y);
+                (c.ra, c.dec)
+            })
+            .collect();
+
+        let batch = wcs.world_to_pixel_batch(&sky);
+        assert_eq!(batch.len(), pixels.len());
+        for (i, (&(bx, by), &(sx, sy))) in batch.iter().zip(pixels.iter()).enumerate() {
+            // Batch result must equal the single-point call for the same sky point...
+            let (single_x, single_y) = wcs.world_to_pixel(sky[i].0, sky[i].1);
+            assert!((bx - single_x).abs() < 1e-9);
+            assert!((by - single_y).abs() < 1e-9);
+            // ...and round-trip back to the original pixel.
+            assert!((bx - sx).abs() < 1e-3, "x round-trip {bx} vs {sx}");
+            assert!((by - sy).abs() < 1e-3, "y round-trip {by} vs {sy}");
+        }
+    }
+
+    #[test]
+    fn test_angular_separation_reference_values() {
+        // Same point → zero.
+        assert!(angular_separation(10.0, 20.0, 10.0, 20.0).abs() < 1e-12);
+
+        // 1 degree apart in dec at the same RA.
+        let s = angular_separation(30.0, 10.0, 30.0, 11.0);
+        assert!((s - 1.0).abs() < 1e-9, "expected 1.0 deg, got {s}");
+
+        // 1 degree apart in RA on the equator (dec=0) → exactly 1 degree.
+        let s = angular_separation(0.0, 0.0, 1.0, 0.0);
+        assert!((s - 1.0).abs() < 1e-9, "expected 1.0 deg, got {s}");
+
+        // 1 degree of RA at dec=60 → 0.5 deg on the sky (cos 60 = 0.5).
+        let s = angular_separation(0.0, 60.0, 1.0, 60.0);
+        assert!((s - 0.5).abs() < 1e-4, "expected ~0.5 deg, got {s}");
+
+        // Antipodal points → 180 degrees.
+        let s = angular_separation(0.0, 0.0, 180.0, 0.0);
+        assert!((s - 180.0).abs() < 1e-6, "expected 180 deg, got {s}");
     }
 
     #[test]

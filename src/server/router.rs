@@ -47,6 +47,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/open", routing::post(v2::images::open))
         .route("/v2/sessions/:sid/hdu", routing::post(v2::images::switch_hdu))
         .route("/v2/sessions/:sid/images", get(v2::images::list_images))
+        // ── v2 API: WCS coordinate transforms (issue #3) ─────────────────────
+        .route("/v2/sessions/:sid/wcs/pix2sky", routing::post(v2::wcs::pix2sky))
+        .route("/v2/sessions/:sid/wcs/sky2pix", routing::post(v2::wcs::sky2pix))
+        .route("/v2/sessions/:sid/wcs/separation", routing::post(v2::wcs::separation))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
 }

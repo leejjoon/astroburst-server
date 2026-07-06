@@ -12,3 +12,4 @@ pub mod images;
 #[allow(dead_code)]
 pub mod region;
 pub mod sessions;
+pub mod wcs;
