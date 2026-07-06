@@ -51,6 +51,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/wcs/pix2sky", routing::post(v2::wcs::pix2sky))
         .route("/v2/sessions/:sid/wcs/sky2pix", routing::post(v2::wcs::sky2pix))
         .route("/v2/sessions/:sid/wcs/separation", routing::post(v2::wcs::separation))
+        // ── v2 API: block-average rebinning (issue #6) ───────────────────────
+        .route("/v2/sessions/:sid/bin", routing::post(v2::bin::bin))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
 }

@@ -293,6 +293,24 @@ curl -s -X POST http://localhost:8080/v2/sessions/$SID/wcs/separation \
 Calling `pix2sky` / `sky2pix` (or a `pixel` separation) against an image with no
 usable WCS header returns `400 wcs_required` — never a panic or 500.
 
+### Block-average rebinning (issue #6)
+
+```bash
+# Block-average the active (or `ref`-named) image by an integer factor,
+# producing a new derived ref at out_dims = in_dims / factor. NaN pixels within
+# a block are ignored (not propagated). Only method "mean" is supported.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/bin \
+  -H 'content-type: application/json' \
+  -d '{"factor":4,"method":"mean"}' | jq .
+# => { "ref": "bin_0", "active_ref": "bin_0", "from_ref": "img_0",
+#      "factor": 4, "method": "mean", "dims": [W/4, H/4], ... }
+```
+
+`method: "sum"` is in the API doc's spec but intentionally unsupported here: it
+returns `400 bad_request` rather than approximating it as `mean * factor²`
+(inexact on edge blocks when dims aren't divisible by `factor`). A `factor`
+larger than the smaller image dimension (empty output) is also a `bad_request`.
+
 ---
 
 ## Testing configuration
@@ -333,6 +351,7 @@ ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
 | `POST /sessions/:sid/fits/header` with unknown slot | `404 not_found` |
 | Second `GET /sessions/:sid/jobs/:jid/stream` | `409 conflict` |
 | `POST /sessions/:sid/stacking/stack` with `"paths":[]` | `400 bad_request` |
+| `POST /v2/sessions/:sid/bin` with `"method":"sum"` | `400 bad_request` (unsupported method) |
 | `POST /sessions` when `ASTROBURST_SESSION_MAX` reached | `503 service_unavailable` with message showing the configured cap |
 | `X-Request-Id: my-id` on any request | Response echoes `x-request-id: my-id` |
 | `GET`/`DELETE`/`POST` on `/v2/sessions/bad-id/...` | `404 not_found` |

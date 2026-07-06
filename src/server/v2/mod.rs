@@ -6,6 +6,7 @@
 //! lifecycle handlers and the shared [`region`] resolver that later slices
 //! (cutout, stats, render, ...) build on.
 
+pub mod bin;
 pub mod images;
 // `region` is shared plumbing consumed by later slices (cutout, stats, ...);
 // its public surface is exercised by unit tests but not yet by a live handler.

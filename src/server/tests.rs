@@ -737,3 +737,85 @@ async fn v2_wcs_without_header_returns_wcs_required() {
     let json = body_json(resp).await;
     assert_eq!(json["error"]["code"], "wcs_required");
 }
+
+// ── 12. v2 bin — block-average rebinning (issue #6) ──────────────────────────
+
+/// Seed a synthetic image directly into a session's cache under `image_ref`,
+/// returning the session handle. Bypasses FITS decoding so tests can pin exact
+/// pixel values (including NaN).
+fn seed_synthetic_image(
+    state: &AppState,
+    sid: &str,
+    image_ref: &str,
+    arr: ndarray::Array2<f32>,
+) -> Arc<Session> {
+    seed_session(state, sid);
+    let session = state.sessions.get(sid).unwrap().clone();
+    let stats = astroburst_lib::core::imaging::stats::compute_image_stats(&arr);
+    session
+        .cache
+        .insert_synthetic(image_ref, Arc::new(arr), stats);
+    session
+}
+
+#[tokio::test]
+async fn v2_bin_mean_matches_hand_computed_block_average_and_ignores_nan() {
+    // 4×4 array; the bottom-right 2×2 block carries a NaN that must be ignored
+    // (block-averaged over the finite pixels), not propagated to the output.
+    let arr = ndarray::Array2::from_shape_vec(
+        (4, 4),
+        vec![
+            1.0, 2.0, 10.0, 20.0, //
+            3.0, 4.0, 30.0, 40.0, //
+            100.0, 200.0, f32::NAN, 9.0, //
+            300.0, 400.0, 9.0, 9.0, //
+        ],
+    )
+    .unwrap();
+
+    let state = AppState::new(cfg());
+    let session = seed_synthetic_image(&state, "s-bin", "img_0", arr);
+
+    let resp = post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-bin/bin",
+        r#"{"factor":2,"method":"mean","ref":"img_0"}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["ref"], "bin_0");
+    assert_eq!(json["active_ref"], "bin_0");
+    assert_eq!(json["from_ref"], "img_0");
+    assert_eq!(json["dims"], serde_json::json!([2, 2]));
+    assert_eq!(json["method"], "mean");
+
+    // Verify the actual binned array against hand-computed block averages.
+    let out = session.cache.get("bin_0").unwrap();
+    let a = out.arr();
+    assert_eq!(a.dim(), (2, 2));
+    assert!((a[[0, 0]] - 2.5).abs() < 1e-4); // mean(1,2,3,4)
+    assert!((a[[0, 1]] - 25.0).abs() < 1e-4); // mean(10,20,30,40)
+    assert!((a[[1, 0]] - 250.0).abs() < 1e-4); // mean(100,200,300,400)
+    // NaN ignored: mean(9,9,9) = 9, NOT NaN.
+    assert!(a[[1, 1]].is_finite());
+    assert!((a[[1, 1]] - 9.0).abs() < 1e-4);
+}
+
+#[tokio::test]
+async fn v2_bin_sum_method_returns_bad_request() {
+    let arr = ndarray::Array2::from_elem((4, 4), 1.0f32);
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-bin-sum", "img_0", arr);
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-bin-sum/bin",
+        r#"{"factor":2,"method":"sum","ref":"img_0"}"#,
+    )
+    .await;
+    // A clear rejection — not a wrong answer or a panic.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "bad_request");
+}
