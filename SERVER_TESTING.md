@@ -322,6 +322,38 @@ normal state: an image with no usable WCS header returns `200 {"present":
 false}` — not a 4xx/5xx — so an agent can branch cleanly on whether sky
 coordinates are available.
 
+### Cutout — region crop into a derived ref (issue #5)
+
+`POST .../cutout` crops a pixel- or sky-specified region of the active (or an
+explicit `ref`) image into a **new derived `image_ref`** (auto-named `cutout_N`
+unless `name` is given), which becomes the session's active ref. The parent's
+`CRPIX1/2` are shifted by the crop origin so the cutout's own WCS stays correct.
+Unlike the strict resolver, cutout tolerates partial (or full) miss of the parent
+frame: off-parent pixels are NaN and the response reports `fraction_on_image`.
+There is no `save`/FITS-write field — a cutout only ever lives in the session.
+
+```bash
+# Pixel region: crop cols 2..6, rows 2..6.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/cutout \
+  -H 'content-type: application/json' \
+  -d '{"region":{"type":"pixel","x":2,"y":2,"width":4,"height":4}}' | jq .
+# => { "ref":"cutout_0", "dims":[4,4], "fraction_on_image":1.0, "wcs_present":true, ... }
+
+# Sky region: centered on RA/Dec with an angular size (arcmin; scalar or [w,h]).
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/cutout \
+  -H 'content-type: application/json' \
+  -d '{"region":{"type":"sky","ra":150.0,"dec":2.0,"size_arcmin":[3.0,3.0]}}' | jq .
+
+# Partial overlap is NOT an error — off-image pixels are NaN, fraction_on_image < 1.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/cutout \
+  -H 'content-type: application/json' \
+  -d '{"region":{"type":"pixel","x":6,"y":6,"width":4,"height":4}}' | jq .fraction_on_image
+# => 0.25   (only the 2×2 corner of a 4×4 request lands on an 8×8 image)
+```
+
+A `sky` region against an image with no usable WCS returns `400 wcs_required`;
+`preserve_wcs:false` drops the WCS from the cutout header instead of shifting it.
+
 ---
 
 ## Testing configuration
@@ -374,3 +406,6 @@ ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
 | `GET /v2/sessions/:sid/wcs` on a WCS-less image | `200 {"present": false}` (never an error) |
 | `GET /v2/sessions/:sid/structure` on a derived/ASDF ref | `400 bad_request` (no FITS source to inspect) |
 | `GET /v2/sessions/:sid/{structure,header,wcs}` before any `open` | `400 bad_request` (no active image) |
+| `POST /v2/sessions/:sid/cutout` with a `sky` region against a WCS-less image | `400 wcs_required` |
+| `POST /v2/sessions/:sid/cutout` with a `ref` not in the session | `404 not_found` |
+| `POST /v2/sessions/:sid/cutout` with a partial-overlap region | `200 OK`, `fraction_on_image < 1.0`, off-image pixels NaN (never an error) |

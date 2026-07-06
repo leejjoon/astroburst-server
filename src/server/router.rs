@@ -51,6 +51,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/structure", get(v2::inspect::structure))
         .route("/v2/sessions/:sid/header", get(v2::inspect::header))
         .route("/v2/sessions/:sid/wcs", get(v2::inspect::wcs))
+        // ── v2 API: cutout — region crop into a derived ref (issue #5) ───────
+        .route("/v2/sessions/:sid/cutout", routing::post(v2::cutout::cutout))
         // ── v2 API: WCS coordinate transforms (issue #3) ─────────────────────
         .route("/v2/sessions/:sid/wcs/pix2sky", routing::post(v2::wcs::pix2sky))
         .route("/v2/sessions/:sid/wcs/sky2pix", routing::post(v2::wcs::sky2pix))

@@ -856,3 +856,110 @@ async fn v2_wcs_summary_no_wcs_returns_present_false() {
     let json = body_json(resp).await;
     assert_eq!(json["present"], false);
 }
+
+// ── v2 API: cutout (issue #5) ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn v2_cutout_pixel_fully_on_image_crops_and_shifts_wcs() {
+    let (state, _dir) = seed_wcs_session("s-cut-px").await;
+
+    // Crop cols 2..6, rows 2..6 out of the 8×8 ramp (value = row*8 + col).
+    let resp = post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-cut-px/cutout",
+        r#"{"region":{"type":"pixel","x":2,"y":2,"width":4,"height":4}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    assert_eq!(json["dims"], serde_json::json!([4, 4]));
+    assert!((json["fraction_on_image"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    assert_eq!(json["wcs_present"], true);
+    // Pixel values: min at (row2,col2)=18, max at (row5,col5)=45; all 16 valid.
+    assert!((json["stats"]["min"].as_f64().unwrap() - 18.0).abs() < 1e-6);
+    assert!((json["stats"]["max"].as_f64().unwrap() - 45.0).abs() < 1e-6);
+    assert_eq!(json["stats"]["valid_count"], 16);
+
+    let cut_ref = json["ref"].as_str().unwrap().to_owned();
+
+    // CRPIX shift: cutout pixel (1,1) is parent pixel (3,3) = CRVAL (150,2).
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-cut-px/wcs/pix2sky",
+        &format!(r#"{{"points":[[1,1]],"ref":"{cut_ref}"}}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let r0 = &json["results"][0];
+    assert!((r0["ra"].as_f64().unwrap() - 150.0).abs() < 1e-6);
+    assert!((r0["dec"].as_f64().unwrap() - 2.0).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn v2_cutout_sky_region_resolves_against_wcs() {
+    let (state, _dir) = seed_wcs_session("s-cut-sky").await;
+
+    // Scale is 1e-4 deg/px = 0.36 arcsec/px; 0.024 arcmin → a 4px box centered
+    // on CRVAL's pixel (3,3), so it sits fully inside the 8×8 frame.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-cut-sky/cutout",
+        r#"{"region":{"type":"sky","ra":150.0,"dec":2.0,"size_arcmin":0.024}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["dims"], serde_json::json!([4, 4]));
+    assert!((json["fraction_on_image"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    assert_eq!(json["wcs_present"], true);
+}
+
+#[tokio::test]
+async fn v2_cutout_partial_overlap_nan_fills_and_reports_fraction() {
+    let (state, _dir) = seed_wcs_session("s-cut-part").await;
+
+    // Region cols 6..10, rows 6..10 on an 8×8 image → only the 2×2 corner
+    // (cols 6,7 rows 6,7) overlaps: fraction = 4/16 = 0.25, 4 valid pixels.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-cut-part/cutout",
+        r#"{"region":{"type":"pixel","x":6,"y":6,"width":4,"height":4}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["dims"], serde_json::json!([4, 4]));
+    let frac = json["fraction_on_image"].as_f64().unwrap();
+    assert!(frac < 1.0);
+    assert!((frac - 0.25).abs() < 1e-12);
+    // Off-image pixels are NaN, so only the 4 overlapping ones count as valid.
+    assert_eq!(json["stats"]["valid_count"], 4);
+}
+
+#[tokio::test]
+async fn v2_cutout_sky_without_wcs_errors_wcs_required() {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("nowcs.fits");
+    v2_fixtures::write_no_wcs_fits(&fits, 8, 8);
+
+    let state = AppState::new(cfg());
+    seed_session(&state, "s-cut-nowcs");
+    post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-cut-nowcs/open",
+        &format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap()),
+    )
+    .await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-cut-nowcs/cutout",
+        r#"{"region":{"type":"sky","ra":150.0,"dec":2.0,"size_arcmin":1.0}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "wcs_required");
+}

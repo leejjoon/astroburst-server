@@ -6,10 +6,12 @@
 //! lifecycle handlers and the shared [`region`] resolver that later slices
 //! (cutout, stats, render, ...) build on.
 
+pub mod cutout;
 pub mod images;
 pub mod inspect;
-// `region` is shared plumbing consumed by later slices (cutout, stats, ...);
-// its public surface is exercised by unit tests but not yet by a live handler.
+// `region` is shared plumbing: the cutout slice has its own partial-overlap
+// resolver (see `cutout`), so the strict `resolve_region` here is still consumed
+// only by unit tests until the stats/histogram slices land.
 #[allow(dead_code)]
 pub mod region;
 pub mod sessions;
