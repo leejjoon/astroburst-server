@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use super::handlers::{io, jobs, pipeline, render, sessions, stacking};
 use super::state::AppState;
+use super::v2;
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -35,6 +36,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/:sid/stacking/drizzle", routing::post(stacking::drizzle))
         // T12 — Pipeline
         .route("/sessions/:sid/pipeline/run", routing::post(pipeline::run))
+        // ── v2 API: sessions & image lifecycle (issue #2) ────────────────────
+        // Session creation reuses the v1 handler verbatim.
+        .route("/v2/sessions", routing::post(sessions::create))
+        .route(
+            "/v2/sessions/:sid",
+            get(v2::sessions::status).delete(v2::sessions::delete),
+        )
+        .route("/v2/sessions/:sid/keepalive", routing::post(v2::sessions::keepalive))
+        .route("/v2/sessions/:sid/open", routing::post(v2::images::open))
+        .route("/v2/sessions/:sid/hdu", routing::post(v2::images::switch_hdu))
+        .route("/v2/sessions/:sid/images", get(v2::images::list_images))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
 }

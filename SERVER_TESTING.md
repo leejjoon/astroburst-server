@@ -214,6 +214,55 @@ Result slots after completion: `pipe/Ha`, `pipe/OIII`.
 
 ---
 
+## 11. v2 API — sessions & image lifecycle
+
+The `/v2` surface is mounted alongside (and reuses the state of) the v1 routes.
+It tracks images by a bare `image_ref` (`img_0`, `img_1`, ...) scoped to the
+session by the URL path. This walkthrough exercises open → images → status →
+hdu → delete against a real FITS fixture.
+
+```bash
+# Create a v2 session (identical handler to POST /sessions).
+SID=$(curl -s -X POST http://localhost:8080/v2/sessions | jq -r .session_id)
+
+# Open a file — becomes the active ref. Returns dims / stats / wcs_present / header.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/open \
+  -H 'content-type: application/json' \
+  -d '{"path":"/data/obs/coadd_r.fits"}' \
+  | jq '{ref, active_ref, dims, wcs_present, median: .stats.median}'
+# => { "ref": "img_0", "active_ref": "img_0", "dims": [W,H], "wcs_present": true, ... }
+
+# List every image ref registered in the session.
+curl -s http://localhost:8080/v2/sessions/$SID/images | jq '{active_ref, count, refs: [.images[].image_ref]}'
+
+# Session status: active ref, image count, cache footprint.
+curl -s http://localhost:8080/v2/sessions/$SID | jq .
+
+# Switch HDU — creates a NEW ref (img_1) from the active ref's source file,
+# without touching the original img_0. img_1 becomes active.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/hdu \
+  -H 'content-type: application/json' \
+  -d '{"hdu":1}' | jq '{ref, active_ref, dims, extname}'
+
+# Both refs are still listed; img_0 remains addressable.
+curl -s http://localhost:8080/v2/sessions/$SID/images | jq '.count'   # => 2
+
+# Keepalive is a no-op (SessionExtractor already refreshed the TTL on resolve).
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/keepalive | jq .
+
+# Delete the session; a subsequent request 404s.
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE http://localhost:8080/v2/sessions/$SID  # => 204
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/v2/sessions/$SID            # => 404
+```
+
+Opening a file whose header carries no WCS returns `wcs_present: false`; a later
+slice's `POST .../cutout` with a `sky` region against such an image will return
+`400 wcs_required`, and an over-large `pixel`/`sky` region returns
+`400 region_out_of_bounds` (with a `hint` naming the image extent) unless
+`clip: true` is passed.
+
+---
+
 ## Testing configuration
 
 Verify env-var overrides work before deploying to a remote machine:
@@ -254,3 +303,7 @@ ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
 | `POST /sessions/:sid/stacking/stack` with `"paths":[]` | `400 bad_request` |
 | `POST /sessions` when `ASTROBURST_SESSION_MAX` reached | `503 service_unavailable` with message showing the configured cap |
 | `X-Request-Id: my-id` on any request | Response echoes `x-request-id: my-id` |
+| `GET`/`DELETE`/`POST` on `/v2/sessions/bad-id/...` | `404 not_found` |
+| `POST /v2/sessions/:sid/hdu` before any `open` | `400 bad_request` (no active image) |
+| `resolve_region` on an over-large region, `clip` unset | `400 region_out_of_bounds` with a `hint` naming the image extent |
+| `resolve_region` on a `sky` region against a WCS-less image | `400 wcs_required` |
