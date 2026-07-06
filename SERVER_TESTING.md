@@ -293,6 +293,35 @@ curl -s -X POST http://localhost:8080/v2/sessions/$SID/wcs/separation \
 Calling `pix2sky` / `sky2pix` (or a `pixel` separation) against an image with no
 usable WCS header returns `400 wcs_required` — never a panic or 500.
 
+### Inspection — structure / header / WCS summary (issue #4)
+
+Read-only "what am I looking at?" endpoints. All accept an optional `?ref=`
+(alias `?image=`) query param; without it they target the session's active ref.
+
+```bash
+# Structure — every HDU of the active ref's source file (index, extname,
+# shape [ny, nx], BITPIX, dtype, has_data). First call on an unfamiliar file.
+curl -s http://localhost:8080/v2/sessions/$SID/structure | jq '.hdus'
+
+# Header — the full set of cached cards as {KEY: {value}} ...
+curl -s http://localhost:8080/v2/sessions/$SID/header | jq '.cards'
+# ... an explicit subset ...
+curl -s "http://localhost:8080/v2/sessions/$SID/header?keys=CTYPE1,CRVAL1" | jq '.cards'
+# ... or a glob for the full WCS matrix.
+curl -s "http://localhost:8080/v2/sessions/$SID/header?keys=CD*_*" | jq '.cards'
+
+# WCS summary — projection, CRPIX/CRVAL, CD, per-axis pixel scale (arcsec/px),
+# rotation (deg E of N), parity, SIP presence.
+curl -s http://localhost:8080/v2/sessions/$SID/wcs | jq .
+# => { "present": true, "projection": "TAN", "pixel_scale_x_arcsec": 0.36,
+#      "rotation_deg": 0.0, "parity": "normal", "sip_present": false, ... }
+```
+
+Unlike the `/wcs/*` transform routes, `GET /wcs` treats a missing WCS as a
+normal state: an image with no usable WCS header returns `200 {"present":
+false}` — not a 4xx/5xx — so an agent can branch cleanly on whether sky
+coordinates are available.
+
 ---
 
 ## Testing configuration
@@ -342,3 +371,6 @@ ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
 | `POST /v2/sessions/:sid/wcs/pix2sky` against a WCS-less image | `400 wcs_required` |
 | `POST /v2/sessions/:sid/wcs/{pix2sky,sky2pix}` before any `open` | `400 bad_request` (no active image) |
 | `POST /v2/sessions/:sid/wcs/pix2sky` with a `ref` not in the session | `404 not_found` |
+| `GET /v2/sessions/:sid/wcs` on a WCS-less image | `200 {"present": false}` (never an error) |
+| `GET /v2/sessions/:sid/structure` on a derived/ASDF ref | `400 bad_request` (no FITS source to inspect) |
+| `GET /v2/sessions/:sid/{structure,header,wcs}` before any `open` | `400 bad_request` (no active image) |

@@ -737,3 +737,122 @@ async fn v2_wcs_without_header_returns_wcs_required() {
     let json = body_json(resp).await;
     assert_eq!(json["error"]["code"], "wcs_required");
 }
+
+// ── v2 API: inspection — structure / header / WCS summary (issue #4) ─────────
+
+/// GET a URI on a fresh clone of the router (v2 inspection is all GET).
+async fn get_uri(app: axum::Router, uri: &str) -> axum::response::Response {
+    app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn v2_structure_lists_every_hdu() {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("mef.fits");
+    v2_fixtures::write_mef_fits(&fits, (8, 8), (16, 4));
+
+    let state = AppState::new(cfg());
+    seed_session(&state, "s-struct");
+    post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-struct/open",
+        &format!(r#"{{"path":"{}","hdu":0}}"#, fits.to_str().unwrap()),
+    )
+    .await;
+
+    let resp = get_uri(build_router(state), "/v2/sessions/s-struct/structure").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["count"], 2);
+
+    let h0 = &json["hdus"][0];
+    assert_eq!(h0["index"], 0);
+    assert_eq!(h0["bitpix"], -32);
+    assert_eq!(h0["dtype"], "float32");
+    assert_eq!(h0["has_data"], true);
+    // Row-major shape [ny, nx] for the 8×8 primary.
+    assert_eq!(h0["shape"], serde_json::json!([8, 8]));
+
+    let h1 = &json["hdus"][1];
+    assert_eq!(h1["index"], 1);
+    assert_eq!(h1["extname"], "WEIGHT");
+    assert_eq!(h1["shape"], serde_json::json!([4, 16]));
+}
+
+#[tokio::test]
+async fn v2_header_full_subset_and_glob() {
+    let (state, _dir) = seed_wcs_session("s-hdr").await;
+
+    // No keys → full header (includes NAXIS1 and the WCS cards).
+    let resp = get_uri(build_router(state.clone()), "/v2/sessions/s-hdr/header").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["cards"]["CTYPE1"]["value"].is_string());
+    assert!(json["cards"]["NAXIS1"]["value"].is_string());
+
+    // Explicit key subset → only the requested cards.
+    let resp = get_uri(
+        build_router(state.clone()),
+        "/v2/sessions/s-hdr/header?keys=CTYPE1,CRVAL1",
+    )
+    .await;
+    let json = body_json(resp).await;
+    assert_eq!(json["count"], 2);
+    assert_eq!(json["cards"]["CTYPE1"]["value"], "RA---TAN");
+    assert_eq!(json["cards"]["CRVAL1"]["value"], "150.0");
+    assert!(json["cards"].get("CD1_1").is_none());
+
+    // Glob → the full CD matrix, nothing else.
+    let resp = get_uri(build_router(state), "/v2/sessions/s-hdr/header?keys=CD*_*").await;
+    let json = body_json(resp).await;
+    assert_eq!(json["count"], 4);
+    for k in ["CD1_1", "CD1_2", "CD2_1", "CD2_2"] {
+        assert!(json["cards"][k]["value"].is_string(), "missing {k}");
+    }
+    assert!(json["cards"].get("CTYPE1").is_none());
+}
+
+#[tokio::test]
+async fn v2_wcs_summary_reports_projection_scale_and_orientation() {
+    let (state, _dir) = seed_wcs_session("s-wcs-sum").await;
+
+    let resp = get_uri(build_router(state), "/v2/sessions/s-wcs-sum/wcs").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["present"], true);
+    assert_eq!(json["projection"], "TAN");
+    assert_eq!(json["crval"], serde_json::json!([150.0, 2.0]));
+    assert_eq!(json["crpix"], serde_json::json!([4.0, 4.0]));
+
+    // CD = diag(-1e-4, 1e-4) → 0.36 arcsec/px, no rotation, standard parity.
+    assert!((json["pixel_scale_x_arcsec"].as_f64().unwrap() - 0.36).abs() < 1e-9);
+    assert!((json["pixel_scale_y_arcsec"].as_f64().unwrap() - 0.36).abs() < 1e-9);
+    assert!(json["rotation_deg"].as_f64().unwrap().abs() < 1e-9);
+    assert_eq!(json["flipped"], false);
+    assert_eq!(json["parity"], "normal");
+    assert_eq!(json["sip_present"], false);
+}
+
+#[tokio::test]
+async fn v2_wcs_summary_no_wcs_returns_present_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("nowcs.fits");
+    v2_fixtures::write_no_wcs_fits(&fits, 8, 8);
+
+    let state = AppState::new(cfg());
+    seed_session(&state, "s-wcs-none");
+    post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-wcs-none/open",
+        &format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap()),
+    )
+    .await;
+
+    let resp = get_uri(build_router(state), "/v2/sessions/s-wcs-none/wcs").await;
+    // No WCS is a normal state — 200 with present:false, not a 4xx/5xx.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["present"], false);
+}
