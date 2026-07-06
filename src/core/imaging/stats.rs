@@ -1,4 +1,4 @@
-use crate::math::median::{exact_median_mut, exact_mad_mut};
+use crate::math::median::{exact_median_mut, exact_mad_mut, f32_cmp};
 use crate::types::image::{Histogram, ImageStats};
 use crate::types::constants::{PADDING_THRESHOLD, MAD_TO_SIGMA, HISTOGRAM_BINS};
 use ndarray::Array2;
@@ -10,6 +10,23 @@ const HIST_BINS: usize = 65536;
 #[inline]
 pub fn is_valid_pixel(v: f32) -> bool {
     v.is_finite() && v > PADDING_THRESHOLD
+}
+
+/// Nearest-rank percentile of `values` (with `pct` a fraction in `0.0..=1.0`),
+/// using the same `select_nth_unstable_by` idiom used elsewhere in the codebase:
+/// pick the element at rank `(n * pct)` in ascending order, with **no**
+/// interpolation between neighbours.
+///
+/// The caller is responsible for pre-filtering non-finite values; `values` is
+/// reordered in place. Returns `NaN` for an empty slice.
+pub fn percentile(values: &mut [f32], pct: f64) -> f32 {
+    let n = values.len();
+    if n == 0 {
+        return f32::NAN;
+    }
+    let idx = ((n as f64 * pct) as usize).min(n - 1);
+    let (_, kth, _) = values.select_nth_unstable_by(idx, f32_cmp);
+    *kth
 }
 
 pub fn compute_image_stats(data: &Array2<f32>) -> ImageStats {
@@ -452,4 +469,33 @@ pub fn downsample_histogram(hist: &Histogram, target_bins: usize) -> Vec<u32> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_nearest_rank_no_interpolation() {
+        // 0..=9 → n=10; idx = (10*pct) as usize, clamped to 9.
+        let base: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        // p50 → idx 5 → value 5 (no averaging of 4 and 5).
+        let mut v = base.clone();
+        assert_eq!(percentile(&mut v, 0.5), 5.0);
+        // p0 → idx 0 → min.
+        let mut v = base.clone();
+        assert_eq!(percentile(&mut v, 0.0), 0.0);
+        // p100 → idx clamped to 9 → max.
+        let mut v = base.clone();
+        assert_eq!(percentile(&mut v, 1.0), 9.0);
+        // p16 → idx 1.
+        let mut v = base.clone();
+        assert_eq!(percentile(&mut v, 0.16), 1.0);
+    }
+
+    #[test]
+    fn percentile_empty_is_nan() {
+        let mut v: Vec<f32> = vec![];
+        assert!(percentile(&mut v, 0.5).is_nan());
+    }
 }

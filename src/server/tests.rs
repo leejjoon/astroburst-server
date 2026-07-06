@@ -343,6 +343,24 @@ mod v2_fixtures {
         std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
     }
 
+    /// A single-HDU FITS image (w×h) with explicit pixel data (row-major,
+    /// `pixels[y*w + x]`) and no WCS. Lets a test place known values / NaNs /
+    /// outliers so region stats can be cross-checked against a hand/astropy
+    /// computation.
+    pub fn write_pixels_fits(path: &std::path::Path, w: usize, h: usize, pixels: &[f32]) {
+        assert_eq!(pixels.len(), w * h, "pixel count must equal w*h");
+        let cards: Vec<(&str, String)> = vec![
+            ("SIMPLE", "T".into()),
+            ("BITPIX", "-32".into()),
+            ("NAXIS", "2".into()),
+            ("NAXIS1", w.to_string()),
+            ("NAXIS2", h.to_string()),
+        ];
+        let mut buf = header_block(&cards);
+        buf.extend_from_slice(&data_block(pixels));
+        std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
+    }
+
     /// A 2-HDU MEF: primary (w0×h0, with WCS) + one IMAGE extension
     /// (w1×h1, EXTNAME=WEIGHT, no WCS). The two HDUs have different dims so a
     /// switch is observable.
@@ -1139,4 +1157,155 @@ async fn v2_pixel_out_of_bounds_errors_not_panics() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = body_json(resp).await;
     assert_eq!(json["error"]["code"], "pixel_out_of_bounds");
+}
+
+// ── v2 region-scoped stats (issue #8) ────────────────────────────────────────
+
+/// Seed a session with a 10×10 image whose 4×4 region at (x=2..6, y=2..6) holds
+/// 13 clustered values (100..=112), two high outliers (8000, 9000) and one NaN;
+/// the rest of the frame is filler (1.0). Reference stats over that region were
+/// cross-checked with `uv run --with astropy --with numpy` (see the test).
+async fn seed_stats_session(id: &str) -> (AppState, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("stats.fits");
+
+    let (w, h) = (10usize, 10usize);
+    let mut pixels = vec![1.0f32; w * h];
+    let region_vals: [f32; 16] = [
+        100.0, 101.0, 102.0, 103.0,
+        104.0, 105.0, 106.0, 107.0,
+        108.0, 109.0, 110.0, 111.0,
+        112.0, 8000.0, 9000.0, f32::NAN,
+    ];
+    for y in 2..6 {
+        for x in 2..6 {
+            pixels[y * w + x] = region_vals[(y - 2) * 4 + (x - 2)];
+        }
+    }
+    v2_fixtures::write_pixels_fits(&fits, w, h, &pixels);
+
+    let state = AppState::new(cfg());
+    seed_session(&state, id);
+    post_json(
+        build_router(state.clone()),
+        &format!("/v2/sessions/{id}/open"),
+        &format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap()),
+    )
+    .await;
+    (state, dir)
+}
+
+#[tokio::test]
+async fn v2_stats_region_base_sigma_clip_and_percentiles() {
+    let (state, _dir) = seed_stats_session("s-stats").await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-stats/stats",
+        r#"{
+            "region": {"type":"pixel","x":2,"y":2,"width":4,"height":4},
+            "sigma_clip": {"sigma": 3.0, "maxiters": 5},
+            "percentiles": [16, 50, 84]
+        }"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    // Base block: matches compute_image_stats over the 15 valid pixels (NaN
+    // excluded; all values > PADDING_THRESHOLD so valid == finite).
+    assert_eq!(json["valid_count"], 15);
+    assert_eq!(json["n_nan"], 1);
+    assert_eq!(json["min"], 100.0);
+    assert_eq!(json["max"], 9000.0);
+    assert!((json["mean"].as_f64().unwrap() - 1225.2).abs() < 0.5);
+    assert_eq!(json["median"], 107.0);
+    assert_eq!(json["mad"], 4.0);
+    assert!((json["sigma"].as_f64().unwrap() - 4.0 * 1.4826).abs() < 1e-3);
+
+    // Region echo reports the resolved (unclipped) rectangle.
+    assert_eq!(json["region"]["x"], 2);
+    assert_eq!(json["region"]["y"], 2);
+    assert_eq!(json["region"]["width"], 4);
+    assert_eq!(json["region"]["height"], 4);
+    assert_eq!(json["region"]["clipped"], false);
+
+    // Sigma-clip rejects the two outliers, leaving 100..=112 (median 106).
+    let c = &json["clipped"];
+    assert_eq!(c["n_rejected"], 2);
+    assert!((c["mean"].as_f64().unwrap() - 106.0).abs() < 1e-6);
+    assert!((c["median"].as_f64().unwrap() - 106.0).abs() < 1e-6);
+    // std is the robust MAD-based sigma of the survivors: mad(100..=112)=3.
+    assert!((c["std"].as_f64().unwrap() - 3.0 * 1.4826).abs() < 1e-3);
+
+    // Nearest-rank percentiles (no interpolation) over the 15 finite values.
+    let p = &json["percentiles"];
+    assert_eq!(p[0]["percentile"], 16.0);
+    assert_eq!(p[0]["value"], 102.0);
+    assert_eq!(p[1]["value"], 107.0);
+    assert_eq!(p[2]["value"], 112.0);
+}
+
+#[tokio::test]
+async fn v2_stats_without_sigma_clip_omits_clipped_block() {
+    let (state, _dir) = seed_stats_session("s-stats-noclip").await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-stats-noclip/stats",
+        r#"{"region":{"type":"pixel","x":2,"y":2,"width":4,"height":4}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json.get("clipped").is_none() || json["clipped"].is_null());
+    // No percentiles requested → no percentiles block.
+    assert!(json.get("percentiles").is_none() || json["percentiles"].is_null());
+}
+
+#[tokio::test]
+async fn v2_stats_region_out_of_bounds_then_clips() {
+    let (state, _dir) = seed_stats_session("s-stats-oob").await;
+
+    // 8-wide region from x=5 runs off the 10px image → strict error by default.
+    let resp = post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-stats-oob/stats",
+        r#"{"region":{"type":"pixel","x":5,"y":0,"width":8,"height":4}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "region_out_of_bounds");
+
+    // clip:true clamps to the image bounds instead of erroring.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-stats-oob/stats",
+        r#"{"region":{"type":"pixel","x":5,"y":0,"width":8,"height":4,"clip":true}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["region"]["clipped"], true);
+    assert_eq!(json["region"]["width"], 5); // 5..10
+}
+
+#[tokio::test]
+async fn v2_stats_full_frame_when_no_region() {
+    let (state, _dir) = seed_stats_session("s-stats-full").await;
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-stats-full/stats",
+        r#"{}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    // Full frame = 100 pixels, one NaN → 99 valid.
+    assert_eq!(json["valid_count"], 99);
+    assert_eq!(json["n_nan"], 1);
+    assert_eq!(json["region"]["width"], 10);
+    assert_eq!(json["region"]["height"], 10);
 }

@@ -11,10 +11,11 @@ pub mod cutout;
 pub mod images;
 pub mod inspect;
 pub mod pixel;
-// `region` is shared plumbing: the cutout slice has its own partial-overlap
-// resolver (see `cutout`), so the strict `resolve_region` here is still consumed
-// only by unit tests until the stats/histogram slices land.
+// `region` is shared plumbing; the stats slice (issue #8) is its first live
+// consumer, and the cutout/render slices will follow. Some helpers remain
+// exercised only by unit tests until then.
 #[allow(dead_code)]
 pub mod region;
 pub mod sessions;
+pub mod stats;
 pub mod wcs;

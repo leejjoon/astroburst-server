@@ -394,6 +394,39 @@ in-bounds pixels were counted), NaNs are skipped from the stats and counted in
 `n_nan`, and `sky` is `null` when the image has no usable WCS (not an error).
 An out-of-bounds `(x, y)` returns `400 pixel_out_of_bounds` — never a panic.
 
+### Region-scoped stats (issue #8)
+
+`POST /v2/sessions/:sid/stats` computes pixel statistics over a region (or the
+full frame when `region` is omitted). The unclipped block always mirrors
+`compute_image_stats`; `sigma_clip` adds a `clipped` block and `percentiles`
+adds nearest-rank (non-interpolated) percentiles.
+
+```bash
+# Full-frame stats.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/stats \
+  -H 'content-type: application/json' -d '{}' | jq .
+
+# Region stats + sigma-clip + percentiles.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/stats \
+  -H 'content-type: application/json' \
+  -d '{
+        "region": {"type":"pixel","x":2,"y":2,"width":4,"height":4},
+        "sigma_clip": {"sigma": 3.0, "maxiters": 5},
+        "percentiles": [16, 50, 84]
+      }' | jq .
+# => { ... "min","max","median","mad","sigma","mean","valid_count","n_nan",
+#      "clipped": {"mean","median","std","n_rejected"},
+#      "percentiles": [{"percentile":16,"value":...}, ...] }
+```
+
+Omitting `sigma_clip` (or passing `null`) drops the `clipped` block; an empty /
+absent `percentiles` drops that block. An out-of-bounds region returns
+`400 region_out_of_bounds` unless the region carries `clip: true`, which clamps
+it to the image bounds (`region.clipped: true` in the response).
+
+Reference values in the automated test were cross-checked with
+`uv run --with astropy --with numpy` against the same 4×4 fixture region.
+
 ---
 
 ## Testing configuration
@@ -450,3 +483,6 @@ ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
 | `POST /v2/sessions/:sid/cutout` with a `sky` region against a WCS-less image | `400 wcs_required` |
 | `POST /v2/sessions/:sid/cutout` with a `ref` not in the session | `404 not_found` |
 | `POST /v2/sessions/:sid/cutout` with a partial-overlap region | `200 OK`, `fraction_on_image < 1.0`, off-image pixels NaN (never an error) |
+| `POST /v2/sessions/:sid/stats` with an over-large region, `clip` unset | `400 region_out_of_bounds` |
+| `POST /v2/sessions/:sid/stats` before any `open` | `400 bad_request` (no active image) |
+| `POST /v2/sessions/:sid/stats` with a `ref` not in the session | `404 not_found` |
