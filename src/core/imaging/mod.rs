@@ -14,3 +14,4 @@ pub mod stats;
 pub mod stf;
 pub mod stretch;
 pub mod wavelet;
+pub mod zscale;
