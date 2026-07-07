@@ -1488,3 +1488,297 @@ async fn v2_histogram_render_png_is_rejected_not_silent() {
     let json = body_json(resp).await;
     assert_eq!(json["error"]["code"], "not_implemented");
 }
+
+// ── 15. v2 render — the agent-facing PNG endpoint (issue #13) ─────────────────
+
+/// Extract the parsed `x-render-resolved` JSON header from a render response.
+fn resolved_header(resp: &axum::response::Response) -> serde_json::Value {
+    let raw = resp
+        .headers()
+        .get("x-render-resolved")
+        .expect("x-render-resolved header present")
+        .to_str()
+        .unwrap();
+    serde_json::from_str(raw).unwrap()
+}
+
+async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+/// Decode a PNG byte buffer into an RGB image for pixel inspection.
+fn decode_rgb(bytes: &[u8]) -> image::RgbImage {
+    image::load_from_memory(bytes).expect("valid PNG").to_rgb8()
+}
+
+/// A small 8×8 gradient (row-major ramp 0..63) for render tests.
+fn render_ramp_8x8() -> ndarray::Array2<f32> {
+    ndarray::Array2::from_shape_fn((8, 8), |(y, x)| (y * 8 + x) as f32)
+}
+
+#[tokio::test]
+async fn v2_render_default_full_frame_is_valid_png() {
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-r", "img_0", render_ramp_8x8());
+
+    let resp = post_json(build_router(state), "/v2/sessions/s-r/render", "{}").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "image/png"
+    );
+    let hdr = resolved_header(&resp);
+    assert_eq!(hdr["scale_algorithm"], "zscale");
+    assert_eq!(hdr["stretch"], "linear");
+    assert_eq!(hdr["colormap"], "gray");
+    assert_eq!(hdr["binning_applied"], 1);
+    assert_eq!(hdr["region"], serde_json::json!({"x":0,"y":0,"w":8,"h":8}));
+
+    let bytes = body_bytes(resp).await;
+    let img = decode_rgb(&bytes);
+    assert_eq!(img.dimensions(), (8, 8));
+}
+
+#[tokio::test]
+async fn v2_render_manual_linear_gray_maps_endpoints_exactly() {
+    // 2×2 with values [0,1,2,3]; manual vmin=0 vmax=3 → 0→black, 3→white.
+    let arr = ndarray::Array2::from_shape_vec((2, 2), vec![0.0f32, 1.0, 2.0, 3.0]).unwrap();
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-rm", "img_0", arr);
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-rm/render",
+        r#"{"scale":{"algorithm":"manual","vmin":0,"vmax":3,"stretch":"linear"},"colormap":"gray"}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hdr = resolved_header(&resp);
+    assert_eq!(hdr["vmin"], 0.0);
+    assert_eq!(hdr["vmax"], 3.0);
+    // value 0 is at vmin → below_vmin includes it; value 3 at vmax → above_vmax.
+    assert!((hdr["clipped_fraction"]["below_vmin"].as_f64().unwrap() - 0.25).abs() < 1e-9);
+    assert!((hdr["clipped_fraction"]["above_vmax"].as_f64().unwrap() - 0.25).abs() < 1e-9);
+
+    let img = decode_rgb(&body_bytes(resp).await);
+    assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0]); // value 0 → black
+    assert_eq!(img.get_pixel(1, 1).0, [255, 255, 255]); // value 3 → white
+}
+
+#[tokio::test]
+async fn v2_render_scale_algorithms_and_stretches_differ() {
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-rd", "img_0", render_ramp_8x8());
+
+    // Four scale algorithms (fixed linear gray) must not all be identical.
+    let mut outputs = Vec::new();
+    for alg in ["zscale", "minmax", "percentile", "manual"] {
+        let body = format!(
+            r#"{{"scale":{{"algorithm":"{alg}","stretch":"linear","vmin":0,"vmax":40,"percentile":[10,90]}}}}"#
+        );
+        let resp = post_json(build_router(state.clone()), "/v2/sessions/s-rd/render", &body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "alg {alg}");
+        outputs.push(body_bytes(resp).await);
+    }
+    let distinct: std::collections::HashSet<_> = outputs.iter().collect();
+    assert!(distinct.len() > 1, "scale algorithms should not all be identical");
+
+    // Five stretches (fixed manual scale) must not all be identical.
+    let mut stretched = Vec::new();
+    for st in ["linear", "log", "sqrt", "asinh", "power"] {
+        let body = format!(
+            r#"{{"scale":{{"algorithm":"manual","vmin":0,"vmax":63,"stretch":"{st}"}}}}"#
+        );
+        let resp = post_json(build_router(state.clone()), "/v2/sessions/s-rd/render", &body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "stretch {st}");
+        stretched.push(body_bytes(resp).await);
+    }
+    let distinct: std::collections::HashSet<_> = stretched.iter().collect();
+    assert_eq!(distinct.len(), 5, "all five stretches should differ on a ramp");
+}
+
+#[tokio::test]
+async fn v2_render_viridis_is_genuinely_colored() {
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-rv", "img_0", render_ramp_8x8());
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-rv/render",
+        r#"{"scale":{"algorithm":"minmax","stretch":"linear"},"colormap":"viridis"}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hdr = resolved_header(&resp);
+    assert_eq!(hdr["colormap"], "viridis");
+
+    let img = decode_rgb(&body_bytes(resp).await);
+    // At least one pixel must be non-grayscale (r != g or g != b).
+    let colored = img.pixels().any(|p| p.0[0] != p.0[1] || p.0[1] != p.0[2]);
+    assert!(colored, "viridis output should contain colored pixels");
+}
+
+#[tokio::test]
+async fn v2_render_region_out_of_bounds_is_silently_clamped() {
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-roob", "img_0", render_ramp_8x8());
+
+    // Region hangs off the top-right of the 8×8 image.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-roob/render",
+        r#"{"region":{"type":"pixel","x":6,"y":6,"width":10,"height":10}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "clamped region must not error");
+    let hdr = resolved_header(&resp);
+    assert_eq!(hdr["region"], serde_json::json!({"x":6,"y":6,"w":2,"h":2}));
+    assert_eq!(hdr["region_clipped"], true);
+    let img = decode_rgb(&body_bytes(resp).await);
+    assert_eq!(img.dimensions(), (2, 2));
+}
+
+#[tokio::test]
+async fn v2_render_max_dim_binning() {
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-rb", "img_0", render_ramp_8x8());
+
+    // max_dim 4 < 8 → factor 2, 4×4 output.
+    let resp = post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-rb/render",
+        r#"{"max_dim":4}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hdr = resolved_header(&resp);
+    assert_eq!(hdr["binning_applied"], 2);
+    assert_eq!(decode_rgb(&body_bytes(resp).await).dimensions(), (4, 4));
+
+    // max_dim 16 > 8 → no binning.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-rb/render",
+        r#"{"max_dim":16}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let hdr = resolved_header(&resp);
+    assert_eq!(hdr["binning_applied"], 1);
+    assert_eq!(decode_rgb(&body_bytes(resp).await).dimensions(), (8, 8));
+}
+
+#[tokio::test]
+async fn v2_render_crosshair_pixel_and_sky_locations() {
+    // Open a real WCS FITS: CRPIX (4,4) 1-based → pixel (3,3) 0-based = CRVAL.
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("wcs.fits");
+    v2_fixtures::write_wcs_fits(&fits, 8, 8);
+    let state = AppState::new(cfg());
+    seed_session(&state, "s-rx");
+    let body = format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap());
+    let resp = post_json(build_router(state.clone()), "/v2/sessions/s-rx/open", &body).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Pixel crosshair at (2, 5): full column 2 and row 5 painted red.
+    let resp = post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-rx/render",
+        r#"{"overlays":[{"type":"crosshair","x":2,"y":5}]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let img = decode_rgb(&body_bytes(resp).await);
+    assert_eq!(img.get_pixel(2, 5).0, [255, 0, 0]);
+    assert_eq!(img.get_pixel(2, 0).0, [255, 0, 0]); // vertical line
+    assert_eq!(img.get_pixel(0, 5).0, [255, 0, 0]); // horizontal line
+
+    // Sky crosshair at CRVAL (150, 2) → projects to pixel (3, 3).
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-rx/render",
+        r#"{"overlays":[{"type":"crosshair","ra":150.0,"dec":2.0}]}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let img = decode_rgb(&body_bytes(resp).await);
+    assert_eq!(img.get_pixel(3, 3).0, [255, 0, 0]);
+    assert_eq!(img.get_pixel(3, 0).0, [255, 0, 0]);
+}
+
+#[tokio::test]
+async fn v2_render_scalebar_without_wcs_is_silently_omitted() {
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-rsb", "img_0", render_ramp_8x8());
+
+    // Baseline render (no overlays).
+    let plain = post_json(build_router(state.clone()), "/v2/sessions/s-rsb/render", "{}").await;
+    assert_eq!(plain.status(), StatusCode::OK);
+    let plain_bytes = body_bytes(plain).await;
+
+    // Same render but requesting a scalebar on a WCS-less image.
+    let with_bar = post_json(
+        build_router(state),
+        "/v2/sessions/s-rsb/render",
+        r#"{"overlays":[{"type":"scalebar","length_arcsec":30}]}"#,
+    )
+    .await;
+    assert_eq!(with_bar.status(), StatusCode::OK, "must not error");
+    let bar_bytes = body_bytes(with_bar).await;
+    // Silently omitted → the scalebar drew nothing, so output is byte-identical.
+    assert_eq!(plain_bytes, bar_bytes);
+}
+
+#[tokio::test]
+async fn v2_render_is_stateless_no_new_ref_or_active_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("wcs.fits");
+    v2_fixtures::write_wcs_fits(&fits, 8, 8);
+    let state = AppState::new(cfg());
+    seed_session(&state, "s-rs");
+    let body = format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap());
+    post_json(build_router(state.clone()), "/v2/sessions/s-rs/open", &body).await;
+
+    let before = body_json(get_uri(build_router(state.clone()), "/v2/sessions/s-rs/images").await).await;
+
+    let resp = post_json(build_router(state.clone()), "/v2/sessions/s-rs/render", "{}").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let after = body_json(get_uri(build_router(state), "/v2/sessions/s-rs/images").await).await;
+    assert_eq!(before["active_ref"], after["active_ref"]);
+    assert_eq!(before["count"], after["count"]);
+    assert_eq!(before["images"], after["images"]);
+}
+
+#[tokio::test]
+async fn v2_render_unknown_colormap_and_stretch_are_bad_request() {
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-re", "img_0", render_ramp_8x8());
+
+    let resp = post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-re/render",
+        r#"{"colormap":"heat"}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-re/render",
+        r#"{"scale":{"stretch":"histeq"}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-re/render",
+        r#"{"scale":{"algorithm":"bogus"}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

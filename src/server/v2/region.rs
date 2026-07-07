@@ -75,20 +75,22 @@ pub struct ResolvedRegion {
     pub clipped: bool,
 }
 
-/// Resolve a `RegionSpec` against an image of size `img_w` × `img_h`.
+/// Convert a `RegionSpec` into a raw pixel rectangle `(x0, y0, w, h)` *without*
+/// any bounds enforcement (the corner may be negative or run off the image).
 ///
-/// `wcs` is required for `Sky` specs and ignored for `Pixel` specs.
-pub fn resolve_region(
+/// This is the shared front half of both resolvers: it performs sky→pixel
+/// projection (erroring `wcs_required` when a `Sky` spec has no usable WCS) and
+/// rejects a zero-size region, but leaves clamping/bounds policy to the caller.
+/// `clip` is intentionally *not* returned — bounds behaviour is the resolver's.
+pub(crate) fn spec_to_rect(
     spec: &RegionSpec,
     img_w: usize,
     img_h: usize,
     wcs: Option<&WcsTransform>,
-) -> Result<ResolvedRegion, AppError> {
-    let (x0, y0, w, h, clip) = match spec {
-        RegionSpec::Pixel { x, y, width, height, clip } => {
-            (*x, *y, *width, *height, clip.unwrap_or(false))
-        }
-        RegionSpec::Sky { ra, dec, size_arcmin, clip } => {
+) -> Result<(i64, i64, usize, usize), AppError> {
+    let (x0, y0, w, h) = match spec {
+        RegionSpec::Pixel { x, y, width, height, .. } => (*x, *y, *width, *height),
+        RegionSpec::Sky { ra, dec, size_arcmin, .. } => {
             let wcs = wcs.ok_or_else(|| AppError::BadRequestWithHint {
                 code: "wcs_required",
                 message: "sky region requires a WCS on the image, but none is present".into(),
@@ -117,7 +119,7 @@ pub fn resolve_region(
             // Center the box on the projected pixel.
             let x0 = (cx - wpx as f64 / 2.0).round() as i64;
             let y0 = (cy - hpx as f64 / 2.0).round() as i64;
-            (x0, y0, wpx, hpx, clip.unwrap_or(false))
+            (x0, y0, wpx, hpx)
         }
     };
 
@@ -128,6 +130,23 @@ pub fn resolve_region(
             hint: Some(format!("image extent is 0..{img_w} x 0..{img_h} px")),
         });
     }
+
+    Ok((x0, y0, w, h))
+}
+
+/// Resolve a `RegionSpec` against an image of size `img_w` × `img_h`.
+///
+/// `wcs` is required for `Sky` specs and ignored for `Pixel` specs.
+pub fn resolve_region(
+    spec: &RegionSpec,
+    img_w: usize,
+    img_h: usize,
+    wcs: Option<&WcsTransform>,
+) -> Result<ResolvedRegion, AppError> {
+    let clip = match spec {
+        RegionSpec::Pixel { clip, .. } | RegionSpec::Sky { clip, .. } => clip.unwrap_or(false),
+    };
+    let (x0, y0, w, h) = spec_to_rect(spec, img_w, img_h, wcs)?;
 
     let x1 = x0 + w as i64; // exclusive right edge
     let y1 = y0 + h as i64; // exclusive top edge
@@ -176,6 +195,52 @@ pub fn resolve_region(
         width: cw,
         height: ch,
         clipped: true,
+    })
+}
+
+/// Resolve a `RegionSpec` but **always clamp** to the image bounds instead of
+/// erroring on overrun — the render endpoint's deliberate silent-clamp policy
+/// (`astro-image-api.md` §19 Workflow A: panning near an edge should show what
+/// is there, not error). A region with no overlap at all degrades to a single
+/// edge pixel so a render still produces a (tiny) image rather than failing.
+pub fn resolve_region_clamped(
+    spec: &RegionSpec,
+    img_w: usize,
+    img_h: usize,
+    wcs: Option<&WcsTransform>,
+) -> Result<ResolvedRegion, AppError> {
+    let (x0, y0, w, h) = spec_to_rect(spec, img_w, img_h, wcs)?;
+
+    let x1 = x0 + w as i64;
+    let y1 = y0 + h as i64;
+
+    let cx0 = x0.clamp(0, img_w as i64);
+    let cy0 = y0.clamp(0, img_h as i64);
+    let cx1 = x1.clamp(0, img_w as i64);
+    let cy1 = y1.clamp(0, img_h as i64);
+    let mut cw = (cx1 - cx0).max(0) as usize;
+    let mut ch = (cy1 - cy0).max(0) as usize;
+    let mut fx0 = cx0;
+    let mut fy0 = cy0;
+
+    // No overlap on an axis → collapse to the nearest single in-bounds pixel.
+    if cw == 0 {
+        fx0 = cx0.min(img_w as i64 - 1).max(0);
+        cw = 1;
+    }
+    if ch == 0 {
+        fy0 = cy0.min(img_h as i64 - 1).max(0);
+        ch = 1;
+    }
+
+    let clipped = fx0 != x0 || fy0 != y0 || cw != w || ch != h;
+
+    Ok(ResolvedRegion {
+        x: fx0 as usize,
+        y: fy0 as usize,
+        width: cw,
+        height: ch,
+        clipped,
     })
 }
 
@@ -255,5 +320,29 @@ mod tests {
         let spec = RegionSpec::Pixel { x: 0, y: 0, width: 0, height: 10, clip: Some(true) };
         let err = resolve_region(&spec, 100, 100, None).unwrap_err();
         assert_eq!(code_of(&err), Some("region_out_of_bounds"));
+    }
+
+    #[test]
+    fn clamped_resolver_never_errors_on_partial_overrun() {
+        // Region hangs off the top-right of an 8×8 image; the clamp resolver
+        // silently trims it and flags `clipped`, instead of erroring.
+        let spec = RegionSpec::Pixel { x: 6, y: 6, width: 10, height: 10, clip: None };
+        let r = resolve_region_clamped(&spec, 8, 8, None).unwrap();
+        assert_eq!(r, ResolvedRegion { x: 6, y: 6, width: 2, height: 2, clipped: true });
+    }
+
+    #[test]
+    fn clamped_resolver_fully_inside_is_not_clipped() {
+        let spec = RegionSpec::Pixel { x: 1, y: 1, width: 3, height: 3, clip: None };
+        let r = resolve_region_clamped(&spec, 8, 8, None).unwrap();
+        assert_eq!(r, ResolvedRegion { x: 1, y: 1, width: 3, height: 3, clipped: false });
+    }
+
+    #[test]
+    fn clamped_resolver_fully_outside_degrades_to_edge_pixel() {
+        // No overlap at all → a single in-bounds pixel, still no error.
+        let spec = RegionSpec::Pixel { x: 100, y: 100, width: 10, height: 10, clip: None };
+        let r = resolve_region_clamped(&spec, 8, 8, None).unwrap();
+        assert_eq!(r, ResolvedRegion { x: 7, y: 7, width: 1, height: 1, clipped: true });
     }
 }

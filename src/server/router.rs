@@ -65,6 +65,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/stats", routing::post(v2::stats::stats))
         // ── v2 API: region-scoped histogram (issue #9) ───────────────────────
         .route("/v2/sessions/:sid/histogram", routing::post(v2::histogram::histogram))
+        // ── v2 API: render — the agent-facing PNG endpoint (issue #13) ────────
+        .route("/v2/sessions/:sid/render", routing::post(v2::render::handler::render))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
 }

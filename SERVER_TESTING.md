@@ -464,6 +464,52 @@ An out-of-bounds region returns `400 region_out_of_bounds` unless it carries
 `clip: true`. PNG plot rendering (`render_png`) is not implemented in this
 slice: requesting it is an explicit `400 not_implemented`, never a silent no-op.
 
+### Render — the agent-facing PNG endpoint (issue #13)
+
+`POST /v2/sessions/:sid/render` is the highest-volume call: it turns the active
+(or named) image into an RGB8 PNG for the *render → look → adjust → render*
+loop. The body is the raw PNG; a JSON `x-render-resolved` **response header**
+echoes back the fully-resolved parameters (the `vmin`/`vmax` zscale actually
+chose, the shown region, binning factor, clipped fractions) so the agent can
+reason numerically and reproduce/tweak the render. An empty body renders the
+full frame with zscale + linear + gray defaults.
+
+- **Scale** — `algorithm`: `zscale` (default) | `minmax` | `percentile`
+  (`percentile: [lo, hi]`, 0–100) | `manual` (`vmin`/`vmax` passthrough).
+- **Stretch** — `linear` (default) | `log` | `sqrt` | `asinh` (`asinh_a`) |
+  `power` (`power`), composed after `vmin`/`vmax` normalization.
+- **Colormap** — `gray` (default) | `viridis`; `invert_cmap` flips it.
+- **`max_dim`** — long side of the PNG; the region is area-binned so
+  `max(w, h) <= max_dim` (`binning_applied` reports the factor; `1` = native).
+- **Region** — always clamps silently to the on-image intersection (never
+  `region_out_of_bounds`): panning near an edge shows what is there.
+- **Overlays** — `crosshair` (`x`/`y` pixel or `ra`/`dec` sky) and `scalebar`
+  (`length_arcsec`), drawn on the final post-binning buffer. A `scalebar` on a
+  WCS-less image is silently omitted. Stateless: never mints a ref or changes
+  `active_ref`.
+
+```bash
+# Default full-frame render; inspect the resolved parameters from the header.
+curl -s -D - -o /tmp/r.png -X POST http://localhost:8080/v2/sessions/$SID/render \
+  -H 'content-type: application/json' -d '{}' | grep -i x-render-resolved
+
+# Manual scale + asinh + viridis, downsampled to 1024px, with overlays.
+curl -s -o /tmp/r2.png -X POST http://localhost:8080/v2/sessions/$SID/render \
+  -H 'content-type: application/json' \
+  -d '{
+        "region": {"type":"pixel","x":100,"y":100,"width":2048,"height":2048},
+        "scale": {"algorithm":"manual","vmin":-0.01,"vmax":0.15,
+                  "stretch":"asinh","asinh_a":0.05},
+        "colormap": "viridis",
+        "max_dim": 1024,
+        "overlays": [{"type":"crosshair","ra":150.0,"dec":2.0},
+                     {"type":"scalebar","length_arcsec":30}]
+      }'
+```
+
+Unknown `colormap`/`stretch`/scale `algorithm` names are `400 bad_request` with
+a hint listing the supported vocabulary.
+
 ---
 
 ## Testing configuration
@@ -527,3 +573,8 @@ ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
 | `POST /v2/sessions/:sid/histogram` with `render_png: true` | `400 not_implemented` (never a silent no-op) |
 | `POST /v2/sessions/:sid/histogram` with `bins: 0` | `400 bad_request` |
 | `POST /v2/sessions/:sid/histogram` before any `open` | `400 bad_request` (no active image) |
+| `POST /v2/sessions/:sid/render` with a partial/fully-out-of-bounds region | `200 OK`, region silently clamped, reported in `x-render-resolved` (never an error) |
+| `POST /v2/sessions/:sid/render` with `colormap`/`stretch`/scale `algorithm` unknown | `400 bad_request` (hint lists supported names) |
+| `POST /v2/sessions/:sid/render` with a `scalebar` overlay on a WCS-less image | `200 OK`, scalebar silently omitted (never an error) |
+| `POST /v2/sessions/:sid/render` before any `open` | `400 bad_request` (no active image) |
+| `POST /v2/sessions/:sid/render` with a `ref` not in the session | `404 not_found` |
