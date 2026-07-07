@@ -999,6 +999,13 @@ fn seed_synthetic_image(
     session
         .cache
         .insert_synthetic(image_ref, Arc::new(arr), stats);
+    // Mirror `open`: the freshly seeded ref becomes the session's active ref, so
+    // endpoints that default to the active ref work without an explicit `ref`.
+    *session
+        .v2
+        .active_ref
+        .try_write()
+        .expect("no lock contention while seeding") = Some(image_ref.to_string());
     session
 }
 
@@ -1308,4 +1315,176 @@ async fn v2_stats_full_frame_when_no_region() {
     assert_eq!(json["n_nan"], 1);
     assert_eq!(json["region"]["width"], 10);
     assert_eq!(json["region"]["height"], 10);
+}
+
+// ── v2 region-scoped histogram (issue #9) ────────────────────────────────────
+
+/// A 4×4 array of the distinct values 1..=16 (all > PADDING_THRESHOLD, no NaN).
+/// With 16 valid pixels the robust auto-range percentiles land exactly on the
+/// min/max, so the endpoint's default range coincides with `compute_histogram`.
+fn hist_ramp_4x4() -> ndarray::Array2<f32> {
+    ndarray::Array2::from_shape_vec((4, 4), (1..=16).map(|i| i as f32).collect()).unwrap()
+}
+
+#[tokio::test]
+async fn v2_histogram_default_auto_range_matches_compute_histogram() {
+    let arr = hist_ramp_4x4();
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-hist", "img_0", arr.clone());
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-hist/histogram",
+        r#"{"bins":8,"ref":"img_0"}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    // For 16 pixels the 0.1/99.9 percentiles == min/max, so the auto-ranged
+    // counts and edges must equal core compute_histogram on the same slice.
+    let expected = astroburst_lib::core::imaging::stats::compute_histogram(&arr, 8);
+    let got: Vec<u64> = json["bins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    let exp: Vec<u64> = expected.bins.iter().map(|&c| c as u64).collect();
+    assert_eq!(got, exp);
+
+    let edges: Vec<f64> = json["bin_edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert_eq!(edges.len(), expected.bin_edges.len());
+    for (g, e) in edges.iter().zip(expected.bin_edges.iter()) {
+        assert!((g - e).abs() < 1e-9, "edge {g} vs {e}");
+    }
+
+    assert_eq!(json["range_source"], "auto");
+    assert_eq!(json["log_counts"], false);
+    assert_eq!(json["min"], 1.0);
+    assert_eq!(json["max"], 16.0);
+}
+
+#[tokio::test]
+async fn v2_histogram_auto_range_excludes_outlier() {
+    // 1024 pixels: a gentle ramp 100.0..~202.2, plus one huge hot pixel that
+    // would otherwise dominate the raw min/max range.
+    let mut vals: Vec<f32> = (0..1023).map(|i| 100.0 + i as f32 * 0.1).collect();
+    vals.push(1.0e6);
+    let arr = ndarray::Array2::from_shape_vec((32, 32), vals).unwrap();
+
+    // Sanity: raw min/max range is blown out by the outlier.
+    let raw = astroburst_lib::core::imaging::stats::compute_histogram(&arr, 10);
+    assert!((raw.max - 1.0e6).abs() < 1.0);
+
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-hist-out", "img_0", arr);
+
+    let resp = post_json(
+        build_router(state),
+        r#"/v2/sessions/s-hist-out/histogram"#,
+        r#"{"bins":10,"range":null}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    assert_eq!(json["range_source"], "auto");
+    // The robust 99.9th percentile clips the hot pixel out of the range.
+    let hi = json["max"].as_f64().unwrap();
+    assert!(hi < 300.0, "auto-range max should exclude the 1e6 outlier, got {hi}");
+    assert!(hi > 200.0, "auto-range max should still cover the band top, got {hi}");
+    let lo = json["min"].as_f64().unwrap();
+    assert!(lo >= 100.0 && lo < 110.0, "auto-range min ~band bottom, got {lo}");
+}
+
+#[tokio::test]
+async fn v2_histogram_explicit_range_and_log_counts() {
+    let arr = hist_ramp_4x4();
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-hist-log", "img_0", arr.clone());
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-hist-log/histogram",
+        r#"{"bins":8,"range":[1,16],"log_counts":true}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+
+    assert_eq!(json["range_source"], "explicit");
+    assert_eq!(json["log_counts"], true);
+    assert_eq!(json["min"], 1.0);
+    assert_eq!(json["max"], 16.0);
+
+    // Each returned value is ln(1 + raw count) of the same-range core histogram.
+    let expected = astroburst_lib::core::imaging::stats::build_histogram(
+        arr.as_slice().unwrap(),
+        8,
+        1.0,
+        16.0,
+    );
+    let got: Vec<f64> = json["bins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect();
+    assert_eq!(got.len(), expected.bins.len());
+    for (g, &c) in got.iter().zip(expected.bins.iter()) {
+        assert!((g - (c as f64 + 1.0).ln()).abs() < 1e-9, "log count {g} vs {c}");
+    }
+}
+
+#[tokio::test]
+async fn v2_histogram_region_out_of_bounds_then_clips() {
+    let arr = hist_ramp_4x4(); // 4×4
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-hist-oob", "img_0", arr);
+
+    // A 4-wide region from x=2 runs off the 4px image → strict error by default.
+    let resp = post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-hist-oob/histogram",
+        r#"{"bins":4,"region":{"type":"pixel","x":2,"y":0,"width":4,"height":2}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "region_out_of_bounds");
+
+    // clip:true clamps to the image bounds instead of erroring.
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-hist-oob/histogram",
+        r#"{"bins":4,"region":{"type":"pixel","x":2,"y":0,"width":4,"height":2,"clip":true}}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["region"]["clipped"], true);
+    assert_eq!(json["region"]["width"], 2); // 2..4
+}
+
+#[tokio::test]
+async fn v2_histogram_render_png_is_rejected_not_silent() {
+    let arr = hist_ramp_4x4();
+    let state = AppState::new(cfg());
+    seed_synthetic_image(&state, "s-hist-png", "img_0", arr);
+
+    let resp = post_json(
+        build_router(state),
+        "/v2/sessions/s-hist-png/histogram",
+        r#"{"bins":8,"render_png":true}"#,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "not_implemented");
 }

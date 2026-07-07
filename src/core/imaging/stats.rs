@@ -404,7 +404,13 @@ pub fn compute_histogram_with_stats(data: &Array2<f32>, stats: &ImageStats) -> H
     build_histogram(slice, HISTOGRAM_BINS, stats.min, stats.max)
 }
 
-fn build_histogram(slice: &[f32], bins: usize, dmin: f64, dmax: f64) -> Histogram {
+/// Build a fixed-`bins` histogram of the valid pixels in `slice` over the
+/// explicit `[dmin, dmax]` value range (values are counted with the same
+/// [`is_valid_pixel`] policy as [`compute_histogram`]; out-of-range values fall
+/// into the nearest edge bin). Exposed so the v2 histogram endpoint can supply a
+/// caller-chosen (explicit or robust percentile) range instead of the raw
+/// min/max that [`compute_histogram`] derives.
+pub fn build_histogram(slice: &[f32], bins: usize, dmin: f64, dmax: f64) -> Histogram {
     let range = dmax - dmin;
     if range < 1e-10 {
         return Histogram {

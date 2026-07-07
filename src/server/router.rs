@@ -63,6 +63,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/pixel", routing::post(v2::pixel::pixel))
         // ── v2 API: region-scoped stats (issue #8) ───────────────────────────
         .route("/v2/sessions/:sid/stats", routing::post(v2::stats::stats))
+        // ── v2 API: region-scoped histogram (issue #9) ───────────────────────
+        .route("/v2/sessions/:sid/histogram", routing::post(v2::histogram::histogram))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
 }

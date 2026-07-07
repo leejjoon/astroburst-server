@@ -8,6 +8,7 @@
 
 pub mod bin;
 pub mod cutout;
+pub mod histogram;
 pub mod images;
 pub mod inspect;
 pub mod pixel;

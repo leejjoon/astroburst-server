@@ -429,6 +429,43 @@ Reference values in the automated test were cross-checked with
 
 ---
 
+### Region-scoped histogram (issue #9)
+
+`POST /v2/sessions/:sid/histogram` builds a fixed-`bins` histogram (default 256)
+of the valid pixels in a region (or the full frame). Two handler-side additions
+sit on top of the core `build_histogram`:
+
+- **auto-range** — when `range` is omitted/`null`, the value range is a robust
+  0.1–99.9th-percentile window rather than the raw min/max, so a single hot
+  pixel can't blow out the whole range (`range_source: "auto"`). An explicit
+  `range: [lo, hi]` is used verbatim (`range_source: "explicit"`).
+- **`log_counts`** — when true, each bin count `c` is returned as `ln(1 + c)`
+  (empty bins stay `0`) instead of the raw integer count.
+
+```bash
+# Auto-ranged 256-bin histogram over the full frame.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/histogram \
+  -H 'content-type: application/json' -d '{}' | jq '{range_source, min, max, mode}'
+
+# Region histogram, explicit range, log-transformed counts.
+curl -s -X POST http://localhost:8080/v2/sessions/$SID/histogram \
+  -H 'content-type: application/json' \
+  -d '{
+        "region": {"type":"pixel","x":2,"y":2,"width":4,"height":4},
+        "bins": 200,
+        "range": [0, 1000],
+        "log_counts": true
+      }' | jq .
+# => { "ref","region","bins":[...],"bin_edges":[...],"min","max",
+#      "log_counts","range_source","mode" }
+```
+
+An out-of-bounds region returns `400 region_out_of_bounds` unless it carries
+`clip: true`. PNG plot rendering (`render_png`) is not implemented in this
+slice: requesting it is an explicit `400 not_implemented`, never a silent no-op.
+
+---
+
 ## Testing configuration
 
 Verify env-var overrides work before deploying to a remote machine:
@@ -486,3 +523,7 @@ ASTROBURST_SESSION_MAX=notanumber cargo run --bin astroburst-server \
 | `POST /v2/sessions/:sid/stats` with an over-large region, `clip` unset | `400 region_out_of_bounds` |
 | `POST /v2/sessions/:sid/stats` before any `open` | `400 bad_request` (no active image) |
 | `POST /v2/sessions/:sid/stats` with a `ref` not in the session | `404 not_found` |
+| `POST /v2/sessions/:sid/histogram` with an over-large region, `clip` unset | `400 region_out_of_bounds` |
+| `POST /v2/sessions/:sid/histogram` with `render_png: true` | `400 not_implemented` (never a silent no-op) |
+| `POST /v2/sessions/:sid/histogram` with `bins: 0` | `400 bad_request` |
+| `POST /v2/sessions/:sid/histogram` before any `open` | `400 bad_request` (no active image) |
