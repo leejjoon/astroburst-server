@@ -7,7 +7,6 @@
 ## Building
 
 ```bash
-cd src-tauri
 cargo build --release \
   --no-default-features \
   --features server,astrometry-net,asdf-full,vizier

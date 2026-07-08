@@ -1,0 +1,3 @@
+[alias]
+# Build the headless Axum server binary (no Tauri/WebKit deps required)
+build-server = "build --no-default-features --features server,astrometry-net,asdf-full,vizier"

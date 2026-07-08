@@ -1,6 +1,6 @@
 # astroburst-client
 
-Async Python client for [astroburst-server](../src-tauri/SERVER.md) — the
+Async Python client for [astroburst-server](../SERVER.md) — the
 headless REST API for the AstroBurst astronomical imaging pipeline.
 
 ## Prerequisites
@@ -8,7 +8,6 @@ headless REST API for the AstroBurst astronomical imaging pipeline.
 Start the server first:
 
 ```bash
-cd src-tauri
 cargo run --bin astroburst-server --no-default-features --features server,astrometry-net,asdf-full,vizier
 # Listening on 127.0.0.1:8080
 ```
@@ -166,6 +165,6 @@ python agent/examples/03_pipeline.py \
 
 ## Full API reference
 
-See [src-tauri/SERVER.md](../src-tauri/SERVER.md) for the complete REST API
+See [SERVER.md](../SERVER.md) for the complete REST API
 documentation, configuration environment variables, session model, and curl
 examples.

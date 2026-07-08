@@ -34,6 +34,14 @@ This API lets an agent open large 2D FITS images once, then iteratively inspect,
 
 ---
 
+> **Status update — 2026-07-06.** Three things below have moved since this document was first written. Inline notes in §20–23 mark the specific passages; this is the summary:
+>
+> 1. **Compressed FITS: done.** AstroBurst's own reader now decodes `RICE_1`/`GZIP_1`/`GZIP_2` tile-compressed image HDUs natively (`infra/fits/compress/`), straight into the existing memmap pipeline. No fitsrs, no cfitsio, no shim. The gap flagged in §22.3 and the fitsrs RICE defect in §23.2 no longer block anything here.
+> 2. **wcs-rs + mapproj: adopted.** §23.3's "adopt now" recommendation was executed (`docs/adr/0001-wcs-rs-for-wcs-engine.md`). Doing so surfaced two real bugs in mapproj 0.4.0's SIP support (wrong polynomial evaluation; a dead inverse-solver fallback) — both filed upstream, worked around in the meantime by keeping AstroBurst's own SIP math behind the `WcsTransform` seam. Full writeup in `wcs-rs-sip-fix.md`.
+> 3. **SEP: becoming an in-house Rust port**, not an FFI binding as originally planned in §20. This is a separate, ongoing effort. Every endpoint below that depends on SEP (§8 background, §9 segmentation detection, §10 aperture photometry/curve-of-growth) is gated behind an optional `sep` feature and ships once that port lands — nothing else in the plan blocks on it.
+
+---
+
 ## 1. Design Principles for Agent Use
 
 - **Stateful sessions.** Opening a multi-GB mosaic is expensive. A session pins the file (memory-mapped) server-side; all subsequent calls reference `session_id` and are fast.
@@ -564,15 +572,15 @@ Overlay contours of the smoothed image on the native render for the figure
 
 The single most important architectural decision. We use a **three-layer approach**:
 
-**Layer 1 — FFI to battle-tested C libraries** (where correctness is hardest to reproduce and the C library is small, stable, and universally trusted):
+**Layer 1 — FFI to battle-tested C libraries** (where correctness is hardest to reproduce and the C library is small, stable, and universally trusted). *This framing assumes a greenfield build. On the AstroBurst-fork path actually being taken (§22), none of the three below end up as FFI at all — see the Status column.*
 
 | C library | Role | Rust access | Status |
 |---|---|---|---|
-| **cfitsio** | FITS I/O, memmap, tile-compressed FITS | `fitsio` crate (maintained bindings) | Ready to use |
-| **wcslib** | All WCS: projections, SIP/TPV distortion | **Custom `wcslib-sys` via bindgen** — no maintained crate exists; budgeted in Phase 0 | Build ourselves |
-| **SEP** (SExtractor core) | Background2D, segmentation detection + deblending, aperture photometry w/ exact pixel overlap | **Custom `sep-sys` via bindgen** — SEP is a small, clean, dependency-free C lib designed for embedding | Build ourselves |
+| **cfitsio** | FITS I/O, memmap, tile-compressed FITS | `fitsio` crate (maintained bindings) | **Superseded** — AstroBurst's own memmap reader handles this directly, including RICE_1/GZIP_1/GZIP_2 tile compression; not needed |
+| **wcslib** | All WCS: projections, SIP/TPV distortion | ~~Custom `wcslib-sys` via bindgen~~ | **Superseded** — adopted `wcs-rs` + `mapproj` instead (pure Rust, MIT/Apache-2.0); see §23 |
+| **SEP** (SExtractor core) | Background2D, segmentation detection + deblending, aperture photometry w/ exact pixel overlap | **In-house pure-Rust port** (separate ongoing project, not FFI) | **In progress** — §8–§10 endpoints that depend on it are gated behind an optional `sep` feature until it ships |
 
-Binding SEP is the highest-leverage decision in the whole plan: one FFI effort covers §8 (background), §9 (detection), and the geometric core of §10 (aperture photometry) with exactly the algorithms astronomers already trust.
+On the greenfield plan, binding SEP was the highest-leverage single decision — one FFI effort covering §8 (background), §9 (detection), and the geometric core of §10 (aperture photometry). On the fork path, the equivalent leverage now comes from the in-house SEP port landing; until then those three sections ship without it (see §22.6 for the MVP fallback).
 
 **Layer 2 — Pure Rust** (well-specified algorithms, or places where Rust's performance is the point):
 
@@ -615,13 +623,13 @@ Frequency scale (VH/H/M/L) is unchanged from the usage analysis: agent call volu
 
 | Endpoint | § | Difficulty | Δ | Freq | Rust implementation | Notes |
 |---|---|---|---|---|---|---|
-| `POST /sessions` (open) | 2 | ★★ | | VH | `fitsio` + DashMap registry | cfitsio handles memmap/compressed FITS |
+| `POST /sessions` (open) | 2 | ★★ | | VH | AstroBurst's own reader + DashMap registry | Already handles memmap + RICE/GZIP tile compression; no `fitsio`/cfitsio needed |
 | `GET /sessions/{id}` / `keepalive` / `DELETE` | 2 | ★ | | M | axum plumbing | |
 | `POST /sessions/{id}/hdu` | 2 | ★ | | M | `fitsio` | |
 | `GET /images` / `save` | 2 | ★★ | ▲ | M | image_ref registry, `fitsio` write | Header/WCS reconstruction on save |
 | `GET /structure` | 3 | ★ | | H | `fitsio` HDU iteration | |
 | `GET /header` | 3 | ★ | | H | `fitsio` + glob matching | |
-| `GET /wcs` | 3 | ★★ | | H | `wcslib-sys` | Parity/rotation math on CD matrix |
+| `GET /wcs` | 3 | ★★ | | H | `wcs-rs` (adopted) | Parity/rotation math on CD matrix |
 | `POST /render` (core) | 4 | ★★★★ | ▲ | **VH** | zscale + stretch + LUT ports, `image` PNG, rayon-tiled binning | Highest-volume endpoint; algorithms are well-specified ports, tested against astropy oracle |
 | `/render` overlays: crosshair, scalebar, compass | 4/17 | ★★ | | H | draw primitives on RGBA buffer | |
 | `/render` overlays: markers, apertures, grid, text | 4/17 | ★★★ | ▲ | H | in-house draw layer + font raster (`ab_glyph`) | Text/label rendering is the fiddly part |
@@ -630,16 +638,16 @@ Frequency scale (VH/H/M/L) is unchanged from the usage analysis: agent call volu
 | `POST /stats` | 5 | ★★ | ▲ | **VH** | ndarray + own sigma-clip | Bit-exact vs astropy fixture |
 | `POST /histogram` | 5 | ★★ | | **VH** | ndarray + `plotters` | |
 | `POST /pixel` | 5 | ★ | | VH | ndarray slice | |
-| `POST /cutout` | 6 | ★★ | | VH | slice + CRPIX shift via wcslib | |
+| `POST /cutout` | 6 | ★★ | | VH | slice + CRPIX shift via wcs-rs | |
 | `POST /bin` | 6 | ★ | | M | ndarray reshape-reduce | |
-| `POST /wcs/pix2sky` / `sky2pix` | 7 | ★★ | ▲ | VH | `wcslib-sys` batch calls | Name resolution: `reqwest` → Sesame (★★, Phase 2) |
+| `POST /wcs/pix2sky` / `sky2pix` | 7 | ★★ | ▲ | VH | `wcs-rs` batch calls (adopted) | Name resolution: `reqwest` → Sesame (★★, Phase 2) |
 | `POST /wcs/separation` | 7 | ★ | | M | haversine on unit vectors | |
-| `POST /background` / `subtract` | 8 | ★★ | | H | **SEP FFI** (`sep_background`) | Falls out of the SEP binding |
-| `POST /detect` (segmentation) | 9 | ★★★ | | H | **SEP FFI** (`sep_extract`) + catalog registry | Deblending comes with SEP |
+| `POST /background` / `subtract` | 8 | ★★ | | H | **In-house SEP port** (optional `sep` feature, in progress) | Falls out of the SEP port; MVP can use AstroBurst's existing gradient extraction meanwhile |
+| `POST /detect` (segmentation) | 9 | ★★★ | | H | **In-house SEP port** (optional `sep` feature) + catalog registry | Deblending comes with SEP; AstroBurst's existing sigma-threshold star detector covers a star-only MVP meanwhile |
 | `POST /detect` (daofind, peaks) | 9 | ★★★ | ▲ | M | port DAOFIND kernel from photutils | Peaks variant is ★ |
 | `GET /catalogs/{id}` | 9 | ★★ | | H | in-memory table + CSV via `csv` crate | |
-| `POST /photometry/aperture` | 10 | ★★★ | | H | **SEP FFI** (`sep_sum_circle/ellipse/circann`) + own error model | SEP provides exact pixel-overlap geometry; gain/sky/flag logic is ours |
-| `POST /photometry/curve_of_growth` | 10 | ★★ | | M | loop over SEP apertures + `plotters` | |
+| `POST /photometry/aperture` | 10 | ★★★ | | H | **In-house SEP port** (optional `sep` feature; exact pixel-overlap geometry) + own error model | Gated on the SEP port; gain/sky/flag logic is ours either way |
+| `POST /photometry/curve_of_growth` | 10 | ★★ | | M | loop over in-house SEP apertures + `plotters` | Same `sep` feature gate |
 | `POST /photometry/psf` | 10 | ★★★★★ | | L–M | **Python sidecar (photutils)** initially; Rust port only on demonstrated demand | Grouping + convergence QC is research-grade |
 | `POST /psf/measure` (seeing map) | 11 | ★★★★ | | M | own star selection + LM Moffat fits, rayon per-cell | Auto star selection is the tuning burden |
 | `POST /psf/build` (ePSF) | 11 | ★★★★ | ▲ | L | ePSF stacking port, or sidecar | Defer |
@@ -648,7 +656,7 @@ Frequency scale (VH/H/M/L) is unchanged from the usage analysis: agent call volu
 | `POST /profile/line` / `box` | 12 | ★★ | | M | own bilinear sampler along the cut | |
 | `POST /arith` | 13 | ★★ | ▼ | M | `evalexpr` + whitelisted fns over ndarray | Safer & simpler than Python eval-sandboxing |
 | `POST /combine` | 13 | ★★★ | | M | rayon chunked reduce; streaming for many large inputs | Memory strategy is the work |
-| `POST /align` (wcs_interp, bilinear) | 14 | ★★★★ | ▲ | M | own reprojection: target-grid → wcslib sky → source-pix → bilinear sample; rayon tiles | No `reproject` equivalent; bilinear first |
+| `POST /align` (wcs_interp, bilinear) | 14 | ★★★★ | ▲ | M | own reprojection: target-grid → wcs-rs sky → source-pix → bilinear sample; rayon tiles | No `reproject` equivalent; bilinear first |
 | `POST /align` (flux-conserving) | 14 | ★★★★★ | ▲ | L | pixel-overlap reprojection | Defer to Phase 4; bilinear covers most agent use |
 | `POST /align` (star_match) | 14 | ★★★★★ | ▲ | L–M | asterism/triangle matching from scratch (astroalign port) | No crate exists; defer, demand-driven |
 | `POST /astrometry/verify` / `refine` | 14 | ★★★ | | M | detect + Gaia TAP + own least-squares offset/rot/scale fit | |
@@ -669,10 +677,10 @@ Frequency scale (VH/H/M/L) is unchanged from the usage analysis: agent call volu
                                │
    [BUILD FIRST]               │        [BUILD FIRST — SENIOR ATTENTION]
    stats, histogram, pixel     │        render core (★★★★, port-and-verify)
-   header, structure, cutout   │        SEP FFI cluster: background +
+   header, structure, cutout   │        in-house SEP port (optional feature): background +
    sessions, pix2sky/sky2pix   │          detect + aperture photometry
    crossmatch, bin             │        catalogs/query (network discipline)
-                               │        wcslib-sys bindings (enables 15+ endpoints)
+                               │        (wcs-rs/mapproj already adopted — no build item remains)
  EASY ─────────────────────────┼─────────────────────────────────── HARD
    arith, upload, separation   │        psf photometry → SIDECAR
    curve_of_growth, profiles   │        star_match, flux-conserving align → DEFER
@@ -682,7 +690,7 @@ Frequency scale (VH/H/M/L) is unchanged from the usage analysis: agent call volu
                           LOW FREQUENCY
 ```
 
-The Rust-specific reading: the top-right quadrant now contains **two infrastructure investments** (wcslib bindings, SEP bindings) that don't map to single endpoints but unlock ~20 of them. The bottom-right quadrant's correct answer is almost never "write it in Rust now" — it's sidecar, subprocess, or defer.
+The Rust-specific reading: the top-right quadrant now contains **one remaining infrastructure investment** (the in-house SEP port — gated behind an optional feature) that doesn't map to a single endpoint but unlocks ~10 of them; wcslib is no longer a build item at all, since wcs-rs/mapproj is already adopted. The bottom-right quadrant's correct answer is almost never "write it in Rust now" — it's sidecar, subprocess, or defer.
 
 ---
 
@@ -692,14 +700,14 @@ Target: **single static-ish binary** (axum service) + container with cfitsio/wcs
 
 ### Phase 0 — Infrastructure & FFI foundations (Weeks 1–3; grew from 1 week in the Python plan)
 
-The FFI layer is new critical-path work and is front-loaded deliberately.
+*This Phase 0 describes the original greenfield plan. On the fork path actually being taken (§22), it is superseded by the revised Phase 0 in §22.6 — kept here for the difficulty-rating context in §20.1.*
 
-- **`wcslib-sys` + safe `wcs-rs` wrapper**: bindgen, RAII around `wcsprm`, batch pix↔sky, SIP/TPV verified against the golden mosaic. *This blocks ~15 endpoints; do it first.*
-- **`sep-sys` + safe wrapper**: bindgen over SEP; background, extract, sum_circle/ellipse/circann round-tripped against sep-python fixtures.
+- ~~`wcslib-sys` + safe `wcs-rs` wrapper~~ — **superseded**: adopted `wcs-rs` + `mapproj` directly instead (pure Rust, see §23); no bindgen/FFI needed.
+- ~~`sep-sys` + safe wrapper~~ — **superseded**: SEP is being built as an in-house pure-Rust port (a separate, ongoing effort, not FFI). Gate §8–§10 SEP-dependent endpoints behind an optional `sep` feature until it ships; MVP proceeds without it (see §22.6).
 - **Service skeleton**: axum + tokio; `spawn_blocking`→rayon bridge for CPU work; session manager (DashMap, TTL eviction, per-session RwLock, memory budget); `image_ref` and catalog registries; shared **region resolver** (any region spec → array view + WCS) used by ~15 endpoints.
 - **Error framework**: machine-readable codes, `hint` generation, `request_echo` middleware.
-- **Oracle test harness**: Python CI job freezes astropy/photutils/sep reference outputs on 4 golden FITS files as JSON fixtures; Rust tests assert tolerance-bounded agreement. Perceptual-hash tests for PNGs.
-- **Build/packaging**: Dockerfile linking cfitsio/wcslib/SEP; document that fully-static musl builds are not worth fighting for given the C dependencies — glibc + shared libs in a slim image is fine.
+- **Oracle test harness**: Python CI job freezes astropy/photutils/sep reference outputs on 4 golden FITS files as JSON fixtures; Rust tests assert tolerance-bounded agreement (this still applies to the in-house SEP port when it lands — sep-python remains the oracle regardless of implementation language). Perceptual-hash tests for PNGs.
+- **Build/packaging**: no C shared-lib dependencies remain on the fork path — cfitsio, wcslib, and SEP are all superseded by pure-Rust equivalents, so a plain `cargo build` suffices for the core service. The sidecar container is still needed for the Phase-3/4 Python escape hatches (PSF photometry, cosmic-ray rejection).
 
 **Exit criteria:** round-trip pix↔sky on the SIP golden file matches astropy < 1 mas; SEP-rust detection catalog on the crowded field is row-identical to sep-python.
 
@@ -716,8 +724,8 @@ The FFI layer is new critical-path work and is front-loaded deliberately.
 ### Phase 2 — Detection, photometry, catalogs (Weeks 7–10)
 **Goal: Workflow B. ~90% of call volume.**
 
-- `background`/`subtract` and `detect` (segmentation) directly on the Phase-0 SEP wrapper; catalog paging/CSV; **ship `markers`/`apertures` overlays in the same milestone** — detection without visual verification is untrustworthy for an agent.
-- `photometry/aperture` (SEP geometry + our gain/sky/flag error model, validated < 0.5% vs photutils fixtures), `curve_of_growth`.
+- `background`/`subtract` and `detect` (segmentation) depend on the in-house SEP port landing — gate both behind an optional `sep` feature. Until then, ship AstroBurst's existing gradient-based background extraction and sigma-threshold star detector as a lighter-weight MVP (star-centric, no deblending) so Workflow B isn't fully blocked. Also: catalog paging/CSV; **ship `markers`/`apertures` overlays in the same milestone** — detection without visual verification is untrustworthy for an agent.
+- `photometry/aperture` (SEP geometry + our gain/sky/flag error model, validated < 0.5% vs photutils fixtures) ships once the `sep` feature lands; `curve_of_growth` likewise.
 - `psf/fit_single` (LM Gaussian/Moffat + triptych).
 - `catalogs/query` (Gaia TAP + SIMBAD first, with disk cone-cache, timeouts, retry), `crossmatch` (kiddo), `upload`; Sesame name resolution in `sky2pix`.
 - `filter`, `profile/line`/`box`.
@@ -745,7 +753,7 @@ The FFI layer is new critical-path work and is front-loaded deliberately.
 ### Cross-cutting guidance (Rust-specific)
 
 - **Async discipline:** axum handlers must never run CPU-bound ndarray work on the tokio executor — everything numeric goes through `spawn_blocking` into a rayon pool sized to physical cores. This is the #1 latency footgun in a Rust image service.
-- **FFI safety:** all cfitsio/wcslib/SEP calls live behind safe wrappers in their own crates with `unsafe` confined and Miri/valgrind runs in CI. wcslib's `wcsprm` is not thread-safe per instance — pool or clone per task.
+- **FFI safety:** no longer a first-order concern on the fork path — cfitsio and wcslib have both been superseded by pure-Rust equivalents (AstroBurst's own reader; `wcs-rs` + `mapproj`), and the in-house SEP port is pure Rust too. Retain the `unsafe`-confinement-plus-Miri/valgrind discipline for any FFI that *does* get introduced later (e.g. a wcslib fallback if TPV/TNX-distorted mosaics ever become a requirement).
 - **dtype policy:** ingest any FITS dtype (incl. BSCALE/BZERO ints), promote to `f32` for analysis by default, `f64` opt-in per session for precision-sensitive photometry. Document it; astronomers will ask.
 - **The oracle suite is the project's spine.** Every ported algorithm (zscale, stretches, sigma-clip, DAOFIND, Lupton, L.A.Cosmic) lands with its astropy-fixture test in the same PR. No fixture, no merge.
 - **Ship measurement + its visualization in the same phase** (detect+markers, photometry+apertures overlay, background+quicklook) — unchanged from the language-agnostic plan, and still the most important product rule.
@@ -755,7 +763,7 @@ The FFI layer is new critical-path work and is front-loaded deliberately.
 
 | Phase | Duration | Endpoints | Cum. call-volume coverage | New vs Python plan |
 |---|---|---|---|---|
-| 0 | 3 wk | 0 (infra + FFI) | — | +2 wk (wcslib/SEP bindings, oracle harness) |
+| 0 | 3 wk | 0 (infra + FFI) | — | +2 wk (wcslib/SEP bindings, oracle harness) — *superseded on the fork path: wcslib dropped (wcs-rs adopted), SEP deferred to an optional feature; see §22.6* |
 | 1 | 3 wk | 12 | ~70% | +1 wk (zscale/stretch/LUT ports) |
 | 2 | 4 wk | ~14 | ~90% | +1 wk (photometry error model, TAP client from scratch) |
 | 3 | 5 wk | ~13 | ~97% | +1 wk (reprojection engine, DS9 parser); sidecar absorbs PSF-phot/CR |
@@ -765,11 +773,11 @@ Roughly **15 weeks to a scientifically complete Rust service** — about 50% mor
 
 ---
 
-*End of document. Endpoint set: 40 endpoints across 16 functional groups. Rust stack: axum, tokio, rayon, ndarray, fitsio (cfitsio), wcslib-sys (in-house), sep-sys (in-house), image, plotters, levenberg-marquardt, kiddo, evalexpr, nom, reqwest — plus solve-field subprocess and an optional photutils/astroscrappy sidecar.*
+*End of document (of the original greenfield plan; §22–23 below are later assessments of building on AstroBurst instead). Endpoint set: 40 endpoints across 16 functional groups. Rust stack, as actually being built: axum, tokio, rayon, ndarray, AstroBurst's own FITS reader (incl. RICE/GZIP tile compression), `wcs-rs` + `mapproj` (adopted), an in-house SEP port (in progress, gated behind an optional `sep` feature), image, plotters, levenberg-marquardt, kiddo, evalexpr, nom, reqwest — plus solve-field subprocess and an optional photutils/astroscrappy sidecar.*
 
 ## 22. Basing the Tool on AstroBurst: Feasibility Assessment
 
-*Assessment date: 2026-07-04, against `samuelkriegerbonini-dev/AstroBurst` v0.5.6 (main). Method: source review of the full Rust backend, test-suite run, and a live smoke test of the headless server.*
+*Assessment date: 2026-07-04, against `samuelkriegerbonini-dev/AstroBurst` v0.5.6 (main). Method: source review of the full Rust backend, test-suite run, and a live smoke test of the headless server. Status notes added 2026-07-06 mark what has changed since (compressed-FITS support shipped, wcs-rs adopted).*
 
 ### 22.1 What AstroBurst is
 
@@ -797,7 +805,7 @@ Three things make AstroBurst far more than a random Rust astro codebase for our 
 | §3 Header inspection | ✅ Endpoint exists; pure-Rust FITS reader (memmap2, BZERO/BSCALE/BLANK) + writer; **bonus: ASDF (JWST/Roman) support we hadn't planned** |
 | §4 Render | 🟡 Partial: full-frame + viewport `{x,y,w,h}` stamp rendering, auto-STF with resolved-parameter echo, tile-pyramid renderer, GHS stretch. Missing: zscale/asinh/log/percentile scaling vocabulary, colormaps (L8 grayscale only), sky-coordinate regions, overlays, N-up orientation |
 | §5 Stats/histogram | 🟡 Core functions exist (`compute_image_stats`, `compute_histogram`, sigma-clip in `math/`); no HTTP endpoints yet |
-| §7 WCS | 🟡 Own implementation: **TAN and SIN projections + SIP distortion**, batch pix↔world; no endpoints yet; no TPV or other projections |
+| §7 WCS | 🟢 **wcs-rs + mapproj adopted** (~23 projections incl. TAN/SIN/ZEA/AIT/CAR + SIP, up from the prior TAN/SIN-only implementation; see §23), validated to astropy to <1e-8°; still no HTTP endpoints yet; still no TPV/TNX (true of every pure-Rust option) |
 | §8 Background | 🟡 Gradient extraction, linked mode, sky neutralize, 1/f de-band — different flavor from Background2D but real |
 | §9 Detection | 🟡 Star detection (sigma threshold, roundness, tile background) — star-centric; no segmentation/deblending for extended sources |
 | §10 Photometry | 🟡 `measure_star`: centroid, net flux w/ annulus sky, instrumental mag, SNR, FWHM, optional **Gaia DR3 cross-match (VizieR cone search client exists)** — single-star interactive, not batch, no exact-overlap geometry or gain-based error model |
@@ -807,9 +815,9 @@ Three things make AstroBurst far more than a random Rust astro codebase for our 
 | §15 Filtering | 🟡 Wavelet, deconvolution, star removal, resample; no plain Gaussian/median filter endpoint, no L.A.Cosmic |
 | §16 Catalogs | 🟡 VizieR/Gaia client (used by SPCC color calibration); no general cone-search/crossmatch/photcal endpoints |
 
-**Genuinely missing (our differentiators to build):** the render vocabulary agents need (zscale + manual vmin/vmax + colormaps + sky regions + overlays + `clipped_fraction`), stats/histogram/pixel/WCS/cutout *endpoints*, segmentation detection + batch exact-overlap aperture photometry (the SEP FFI plan stands), catalog registry/crossmatch/photcal, `arith`/masks/DS9 regions/profiles, WCS reprojection, cosmic rays.
+**Genuinely missing (our differentiators to build):** the render vocabulary agents need (zscale + manual vmin/vmax + colormaps + sky regions + overlays + `clipped_fraction`), stats/histogram/pixel/WCS/cutout *endpoints*, segmentation detection + batch exact-overlap aperture photometry (now planned as an in-house pure-Rust SEP port, gated behind an optional `sep` feature — see the status addendum above §1), catalog registry/crossmatch/photcal, `arith`/masks/DS9 regions/profiles, WCS reprojection, cosmic rays.
 
-**Gaps to verify or fix in the base itself:** no RICE/HCOMPRESS tile-compressed FITS support (no hits in the reader — ground-based `.fits.fz` archives won't open; plan a decompression shim or a cfitsio-backed fallback path), WCS limited to TAN/SIN+SIP (fine for HST/JWST stamps; DECam/ZTF-style TPV mosaics need work — extend in Rust or revisit `wcslib-sys` for exotic projections only).
+**Gaps to verify or fix in the base itself — both since resolved:** ~~no RICE/HCOMPRESS tile-compressed FITS support~~ (AstroBurst's reader now decodes RICE_1/GZIP_1/GZIP_2 tile-compressed image HDUs natively — own implementation, not fitsrs/cfitsio; HCOMPRESS/PLIO remain unsupported if ever needed), ~~WCS limited to TAN/SIN+SIP~~ (wcs-rs+mapproj adoption, §23, now covers ~23 projections; only TPV/TNX-style distortion, e.g. DECam/ZTF mosaics, would still force a wcslib fallback — unchanged from the original assessment).
 
 ### 22.4 License and governance
 
@@ -818,7 +826,7 @@ Three things make AstroBurst far more than a random Rust astro codebase for our 
 
 ### 22.5 Recommendation: yes — fork, upstream-first
 
-Base the tool on AstroBurst rather than starting fresh. The overlap is not incidental: session/job/render server plumbing, pure-Rust FITS I/O proven on real HST/JWST data by ~400 tests, and the entire calibration/alignment/stacking layer are exactly the expensive parts of §21 Phases 0, 1, and 3. Two of our hardest Phase-0 line items dissolve: **no cfitsio FFI needed** (their reader replaces it, pending the compressed-FITS shim) and **no server skeleton to build**. The strategic fit is unusual — their roadmap wants to become what we are specifying, so much of our work is upstreamable, which keeps the fork thin and the maintenance burden shared.
+Base the tool on AstroBurst rather than starting fresh. The overlap is not incidental: session/job/render server plumbing, pure-Rust FITS I/O proven on real HST/JWST data by ~400 tests, and the entire calibration/alignment/stacking layer are exactly the expensive parts of §21 Phases 0, 1, and 3. Two of our hardest Phase-0 line items dissolve: **no cfitsio FFI needed** (their reader replaces it outright, including the compressed-FITS path — no shim required anymore) and **no server skeleton to build**. The strategic fit is unusual — their roadmap wants to become what we are specifying, so much of our work is upstreamable, which keeps the fork thin and the maintenance burden shared.
 
 **Structure:** fork; execute their own roadmap's workspace split (`astroburst-core` library crate — mechanical, per their analysis); build our agent API as an expanded server crate on top. Upstream general-purpose pieces (stats/WCS/cutout endpoints, render vocabulary, detection); keep agent-specific opinions (our JSON envelope, `request_echo`, catalog registry semantics) in the fork if upstream tastes differ. Sign the CLA early and open a coordination issue before large PRs.
 
@@ -826,9 +834,9 @@ Base the tool on AstroBurst rather than starting fresh. The overlap is not incid
 
 | Phase | Was (greenfield Rust) | Now (AstroBurst fork) |
 |---|---|---|
-| 0 | 3 wk — FFI (cfitsio/wcslib/SEP), server skeleton, oracle harness | **1–1.5 wk** — fork + workspace split, oracle harness (still non-negotiable: validate their FITS/WCS/stats against astropy fixtures), our error envelope + `request_echo` middleware. cfitsio dropped; wcslib deferred pending projection needs; SEP kept for Phase 2 |
+| 0 | 3 wk — FFI (cfitsio/wcslib/SEP), server skeleton, oracle harness | **~1 wk** — fork + workspace split, oracle harness (still non-negotiable: validate their FITS/WCS/stats against astropy fixtures), our error envelope + `request_echo` middleware. cfitsio dropped (own reader, incl. compression); **wcslib dropped — wcs-rs/mapproj already adopted**; SEP deferred to Phase 2, gated behind an optional `sep` feature until the in-house Rust port lands |
 | 1 | 3 wk — render core + stats/WCS endpoints from scratch | **2 wk** — extend existing render path: zscale port, stretch vocabulary, colormap LUTs, sky regions, `clipped_fraction`, crosshair/scalebar overlays; add stats/histogram/pixel/cutout/pix2sky/sky2pix endpoints over existing core functions |
-| 2 | 4 wk | **3–3.5 wk** — SEP FFI for segmentation + exact apertures (unchanged); catalog registry/crossmatch/photcal builds on their VizieR client; `psf/fit_single` builds on their PSF module |
+| 2 | 4 wk | **3–3.5 wk** — segmentation + exact apertures ship once the in-house SEP port lands (optional `sep` feature; MVP background/detection meanwhile via AstroBurst's existing gradient extraction + star detector); catalog registry/crossmatch/photcal builds on their VizieR client; `psf/fit_single` builds on their PSF module |
 | 3 | 5 wk | **2.5–3 wk** — stacking/calibration/drizzle already done; remaining: WCS reprojection (reuse their NaN-aware bicubic sampler), `arith`, masks, DS9 regions, profiles, `astrometry/verify` (plate solve exists), remaining overlays |
 | 4 | demand-driven | unchanged (sidecar for PSF-fit photometry & CR rejection; `solve-field` local subprocess as an offline alternative to their web-service solver) |
 
@@ -837,7 +845,7 @@ Base the tool on AstroBurst rather than starting fresh. The overlap is not incid
 
 ## 23. Adopting the CDS Rust Stack: fitsrs, wcs-rs, mapproj
 
-*Assessment date: 2026-07-04, against fitsrs 0.4.1, wcs 0.4.2, mapproj 0.4.0 (crates.io releases). Method: source review plus an empirical test program compiled against the released crates, run on AstroBurst's sample HST WFPC2 frame, with astropy 7.x as the numerical oracle.*
+*Assessment date: 2026-07-04, against fitsrs 0.4.1, wcs 0.4.2, mapproj 0.4.0 (crates.io releases). Method: source review plus an empirical test program compiled against the released crates, run on AstroBurst's sample HST WFPC2 frame, with astropy 7.x as the numerical oracle. **Update 2026-07-06: the wcs-rs/mapproj recommendation below was acted on — see the revised §23.3.***
 
 ### 23.1 What the stack is
 
@@ -855,18 +863,19 @@ A Rust test program (fitsrs + wcs-rs) against the 1600×1600 HST WFPC2 frame, wi
 
 1. **Uncompressed pixel reads: bit-exact.** All probed pixels identical to astropy to full f32 precision.
 2. **WCS: exact, with a convention to pin.** Raw pix→sky initially disagreed with astropy(origin=0) by a constant ~0.14″; re-running the oracle with origin=1 produced agreement **to all 8 printed decimals** on every test point. Conclusion: wcs-rs `ImgXY` uses the FITS 1-based convention; our API's 0-indexed pixels need a +1 shim at the boundary. Numerics are validated; this is exactly the class of silent bug the §21 oracle harness exists to catch.
-3. **RICE tile-compression: currently broken on standard input.** On an astropy-generated `RICE_1` file (both quantized-float and lossless int16 variants): debug builds **panic with integer overflow** inside the ported cfitsio RICE decoder; release builds (where overflow wraps) run but return a **short read (2,457,600 of 2,560,000 pixels) with wrong values** (e.g. 6334 vs oracle 135). The README's own caveats gesture at limited testing here. Until this is fixed upstream, fitsrs does not actually close AstroBurst's `.fits.fz` gap, despite the feature being on the box.
+3. **RICE tile-compression: currently broken on standard input.** On an astropy-generated `RICE_1` file (both quantized-float and lossless int16 variants): debug builds **panic with integer overflow** inside the ported cfitsio RICE decoder; release builds (where overflow wraps) run but return a **short read (2,457,600 of 2,560,000 pixels) with wrong values** (e.g. 6334 vs oracle 135). The README's own caveats gesture at limited testing here. *Update 2026-07-06: this no longer matters for AstroBurst's own `.fits.fz` gap — see §23.3 — but the fitsrs bug itself is still real and worth filing upstream for other users.*
 
-### 23.3 Recommendation: split the verdict
+### 23.3 Recommendation: split the verdict — update: acted on (2026-07-06)
 
-**wcs-rs + mapproj: adopt now — clear win.** AstroBurst's in-house WCS supports two projections (TAN, SIN) + SIP; the CDS stack supports ~23 + SIP with numerics we just validated exactly against astropy, maintained by an institution rather than a side module of an imaging app. AstroBurst already funnels all WCS use through one internal type (`core/astrometry/wcs.rs::WcsTransform`), so this is a contained swap behind an existing seam: keep the `WcsTransform` API, back it with wcs-rs, add the 0-/1-based shim, and extend the oracle fixtures to cover a projection zoo (TAN, SIN, ZEA, AIT, CAR at minimum, ± SIP). Estimated effort ~1 week including tests. This removes the `wcslib-sys` question from the plan entirely except for TPV/TNX-distorted survey mosaics (DECam/ZTF style), which remain the one case that would force wcslib FFI or an in-Rust TPV extension — decide only if that data actually shows up.
+**wcs-rs + mapproj: adopted.** This recommendation was executed — see `docs/adr/0001-wcs-rs-for-wcs-engine.md`. AstroBurst's WCS now runs through `wcs-rs` + `mapproj` behind the existing `WcsTransform` seam (`core/astrometry/wcs.rs`), replacing the prior TAN/SIN-only implementation with ~23 projections, numerics validated against astropy per §23.2.
 
-**fitsrs: adopt selectively, not yet as the primary reader.** Three concrete blockers for "primary":
-- **No writer** — cutout/save, derived-product export, and the stacking pipeline all need FITS output; AstroBurst's writer stays regardless.
-- **Performance model mismatch** — fitsrs is an iterator/`Read`-based streaming parser; AstroBurst's reader is memmap + zero-copy slicing, which is what makes the <100 ms viewport budget on multi-GB mosaics plausible. Replacing memmap slices with a full-stream decode per region would be a regression on our hottest path.
-- **The RICE defect above.**
+The empirical pass in §23.2 only exercised the projection math, not SIP — and the migration surfaced two real bugs in **mapproj 0.4.0's SIP support**, not yet fixed upstream (filed; full repro and fix in `wcs-rs-sip-fix.md`):
+1. `SipCoeff::p` squares `u`/`v` at each step instead of multiplying by them — it evaluates a different polynomial altogether, not just imprecisely (a corner-pixel test case came back ~83° off, not a rounding error).
+2. `Sip::inverse` never calls the crate's own `bivariate_newton` fallback for forward-only-SIP headers (`A_`/`B_` present, no `AP_`/`BP_`) — a common, legal FITS convention — so sky→pixel silently fails whenever that shape of header shows up.
 
-What fitsrs should do for us *now*: (a) **bintable reading** — FITS catalogs (Gaia dumps, SExtractor outputs) for §16 endpoints, which AstroBurst cannot parse at all; (b) gzip and async ingestion paths. What it should do *after an upstream fix*: become the **compressed-FITS ingestion path** (decode `.fits.fz` once on open → hand the plane to the memmap-style in-memory pipeline). We have a minimal reproducer (astropy `CompImageHDU`, RICE_1, 1600×1600 f32/i16); filing it upstream — ideally with the `wrapping_add` patch and a fixture — is a cheap, high-goodwill contribution to a responsive team whose README explicitly invites use-case reports.
+**Workaround in place:** `WcsTransform::from_header` strips any `-SIP` CTYPE suffix before constructing the wcs-rs engine, and AstroBurst evaluates SIP itself (`sip_forward`/`sip_inverse`, unaffected by the mapproj bugs) rather than delegating to mapproj. Once both bugs are fixed upstream and a release is cut, the workaround can be deleted and SIP handed fully to wcs-rs — tracked in `wcs-rs-sip-fix.md`.
 
-**Strategically, converging on the CDS stack is the right long-term direction**: it is the only institutionally-maintained Rust astronomy I/O ecosystem, it connects us to cds-healpix/MOC crates (future HiPS/coverage features), and every piece we upstream reduces our fork's surface. The sequencing that respects the evidence: **wcs-rs/mapproj in Phase 1** (folded into the render/WCS-endpoint work, net-neutral on schedule since it deletes in-house projection code), **fitsrs for bintables in Phase 2**, **fitsrs for compressed FITS when upstream is fixed** — with every swap gated by the oracle suite, which this assessment has now demonstrated catching both a convention mismatch and a real decoder bug on its first outing.
+**fitsrs: still not adopted as primary reader — and the motivating gap has since closed independently.** The three original blockers stand (no writer, streaming-vs-memmap performance mismatch, the RICE defect above), but AstroBurst no longer needs fitsrs to solve compressed FITS: **it now has its own working RICE_1/GZIP_1/GZIP_2 tile-decompression** (`infra/fits/compress/`), decoding directly into the existing memmap pipeline — no fitsrs, no cfitsio, no shim. fitsrs remains worth a look later purely for **bintable reading** (FITS catalogs — Gaia dumps, SExtractor outputs — for §16, which AstroBurst still cannot parse), independent of the imaging path. The RICE bug found here is still worth filing upstream as a goodwill contribution (minimal reproducer already in hand), but it's off AstroBurst's critical path now.
+
+**Strategically:** the wcs-rs half of the CDS-stack bet has paid off and is done — the only remaining exception is TPV/TNX-distorted survey mosaics (DECam/ZTF style), which would still force a wcslib fallback or an in-Rust TPV extension if that data ever shows up. The fitsrs half is optional/deferred, worth revisiting only if bintable catalog parsing (§16) becomes a priority.
 

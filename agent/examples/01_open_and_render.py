@@ -7,7 +7,6 @@ Usage:
 
 The server must be running and reachable at http://localhost:8080.
 Start it with:
-    cd src-tauri
     cargo run --no-default-features --features server,astrometry-net,asdf-full,vizier
 """
 from __future__ import annotations

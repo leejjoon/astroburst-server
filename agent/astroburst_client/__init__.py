@@ -18,7 +18,7 @@ Quickstart::
 
     asyncio.run(main())
 
-See ``src-tauri/SERVER.md`` in the repository for the full REST API reference.
+See ``SERVER.md`` in the repository for the full REST API reference.
 """
 
 __version__ = "0.1.0"

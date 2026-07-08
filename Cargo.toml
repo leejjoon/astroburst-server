@@ -2,10 +2,10 @@
 name = "astroburst"
 version = "0.5.3"
 edition = "2021"
-description = "AstroBurst -- High-Performance JWST FITS Processing"
+description = "Headless HTTP server for FITS image processing, built for AI agents -- forked from AstroBurst's imaging engine"
 license = "GPL-3.0-or-later"
-authors = ["Samuel Krieger Bonini"]
-repository = "https://github.com/samuelkriegerbonini-dev/AstroBurst"
+authors = ["Samuel Krieger Bonini", "Jae-Joon Lee"]
+repository = "https://github.com/leejjoon/astroburst-server"
 
 [dependencies]
 # Desktop (Tauri) — optional; included in default for existing `cargo tauri build` / `cargo build`
