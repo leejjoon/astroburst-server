@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build astroburst-server (static musl)
+        run: |
+          cargo build --release \
+            --target x86_64-unknown-linux-musl \
+            --no-default-features \
+            --features server,astrometry-net,asdf-full,vizier \
+            --bin astroburst-server
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIST="astroburst-server-${VERSION}-linux-x86_64"
+          mkdir -p "$DIST"
+          cp "target/x86_64-unknown-linux-musl/release/astroburst-server" "$DIST/"
+          cp SERVER.md SERVER_TESTING.md LICENSE "$DIST/"
+          tar czf "${DIST}.tar.gz" "$DIST"
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: astroburst-server ${{ github.ref_name }}
+          draft: true
+          files: astroburst-server-*-linux-x86_64.tar.gz
