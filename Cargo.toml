@@ -1,6 +1,6 @@
 [package]
 name = "astroburst"
-version = "0.5.3"
+version = "0.1.0"
 edition = "2021"
 description = "Headless HTTP server for FITS image processing, built for AI agents -- forked from AstroBurst's imaging engine"
 license = "GPL-3.0-or-later"
