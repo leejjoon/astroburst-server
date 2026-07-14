@@ -574,6 +574,54 @@ mod tests {
         assert!((coord.dec - 45.0).abs() < 1e-6, "dec={}", coord.dec);
     }
 
+    /// Documents a confirmed mapproj 0.4.0 bug (see `wcs-rs-sip-fix.md`, "Bug 3"):
+    /// `WcsImgXY2ProjXY::inverse()` in `img2proj.rs` swaps the off-diagonal terms
+    /// of the CD-matrix inverse (`icd12`/`icd21` use `cd21`/`cd12` respectively,
+    /// instead of `cd12`/`cd21`). For a diagonal CD matrix (no rotation --true of
+    /// every other fixture in this file) the swap is invisible, since both terms
+    /// are zero either way. A real rotated CD matrix (this is 656nmos.fits' actual
+    /// header, a WFPC2 frame with a ~-47 deg CD-matrix rotation) exposes it: a
+    /// world_to_pixel round-trip through mapproj's own analytic inverse is off by
+    /// several tenths of a pixel, confirmed (via a standalone repro isolating just
+    /// the linear CD step, no spherical/TAN math at all) to vanish to ~1e-14 once
+    /// the swap is corrected. This is unrelated to SIP and not currently worked
+    /// around -- AstroBurst has no equivalent seam to intercept just this one
+    /// internal step the way `sip_forward`/`sip_inverse` intercept SIP.
+    #[test]
+    fn test_known_mapproj_bug_rotated_cd_matrix_roundtrip_error() {
+        let h = make_header(&[
+            ("NAXIS1", "1600"),
+            ("NAXIS2", "1600"),
+            ("CRPIX1", "386.5"),
+            ("CRPIX2", "396."),
+            ("CRVAL1", "274.71149247724"),
+            ("CRVAL2", "-13.816384007184"),
+            ("CD1_1", "1.878013E-5"),
+            ("CD1_2", "-2.031193E-5"),
+            ("CD2_1", "-2.029358E-5"),
+            ("CD2_2", "-1.879711E-5"),
+            ("CTYPE1", "RA---TAN"),
+            ("CTYPE2", "DEC--TAN"),
+        ]);
+        let wcs = WcsTransform::from_header(&h).unwrap();
+
+        // Once mapproj fixes the swap, this round-trip should tighten to ~1e-9
+        // (matching test_roundtrip_tan below) -- if this assertion starts
+        // failing because the error got *smaller*, that's the signal to lower
+        // the bound and delete this comment.
+        let mut max_err = 0.0_f64;
+        for &(x, y) in &[(3.0, 3.0), (100.0, 100.0), (800.0, 800.0)] {
+            let coord = wcs.pixel_to_world(x, y);
+            let (px, py) = wcs.world_to_pixel(coord.ra, coord.dec);
+            max_err = max_err.max((px - x).abs()).max((py - y).abs());
+        }
+        assert!(
+            (0.01..1.0).contains(&max_err),
+            "expected the known ~0.1-0.4px mapproj bug, got {max_err} -- if this is now \
+             ~1e-9, mapproj fixed the bug; tighten this test and update wcs-rs-sip-fix.md"
+        );
+    }
+
     #[test]
     fn test_roundtrip_tan() {
         let h = make_header(&[
