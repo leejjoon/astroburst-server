@@ -146,7 +146,7 @@ pub fn rice_decode(data: &[u8], nx: usize, params: &RiceParams) -> Vec<i64> {
     }
 }
 
-fn sign_extend(v: u32, bits: u32) -> i64 {
+pub(crate) fn sign_extend(v: u32, bits: u32) -> i64 {
     if bits >= 32 {
         return v as i32 as i64;
     }

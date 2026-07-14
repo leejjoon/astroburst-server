@@ -123,6 +123,8 @@ pub const RES_DIMENSION_INFO: &str = "dimension_info";
 
 pub const RES_FRAMES: &str = "frames";
 pub const RES_BITPIX: &str = "bitpix";
+pub const RES_COMPRESS: &str = "compress";
+pub const RES_QUANTIZE_LEVEL: &str = "quantize_level";
 pub const RES_FRAME_INDEX: &str = "frame_index";
 pub const RES_SPECTRUM: &str = "spectrum";
 pub const RES_SPECTRAL_CLASSIFICATION: &str = "spectral_classification";
