@@ -225,6 +225,21 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_int32_beyond_f32_mantissa() {
+        // Values here (~2^30) exceed f32's 24-bit exact-integer range --
+        // this proves the Rice codec itself (as used by the MEF writer's
+        // lossless-integer path, which reads/writes raw i64 directly, never
+        // going through an f32 conversion) is exact at this magnitude, even
+        // though the app's *decode* pipeline elsewhere (tiles.rs::scale_ints)
+        // downconverts to f32 for general consumption.
+        let base = 1_073_741_824i64; // 2^30
+        let pixels: Vec<i64> = (0..40)
+            .map(|i| if i % 2 == 0 { base + i } else { -base - i })
+            .collect();
+        roundtrip(&pixels, &RiceParams { blocksize: 32, bytepix: 4, signed: true });
+    }
+
+    #[test]
     fn roundtrip_non_block_aligned_width() {
         // nx not a multiple of blocksize, matching the decoder's comment
         // about non-block-aligned tile widths.
@@ -251,6 +266,30 @@ mod tests {
         let pixels: Vec<i64> = (0..500)
             .map(|_| (next() as i32 % 20000) as i64)
             .collect();
+        roundtrip(&pixels, &RiceParams { blocksize: 32, bytepix: 4, signed: true });
+    }
+
+    #[test]
+    fn roundtrip_wide_high_entropy_bytepix4_hits_zero_leftover_bits() {
+        // Regression test for a real crash found compressing a full-size
+        // (2040-column) int32/quantized-float32 row: rice.rs's decoder had
+        // `let mut diff: u32 = b << k;` where `k = bbits - nbits` can be
+        // exactly 32 (BYTEPIX=4's bbits) whenever `nbits == 0` entering a
+        // high-entropy (verbatim) block -- a legitimately reachable state,
+        // just one this codebase's earlier small-scale tests never
+        // happened to land on. `b << 32` panics (invalid shift for u32).
+        // A wide (2040, matching real image rows), full-i32-range random
+        // stream reliably cycles through every possible leftover-bits
+        // state across its ~64 blocks, including nbits==0, so this
+        // reproduces the crash deterministically rather than by luck.
+        let mut state: u32 = 0xDEADBEEF;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let pixels: Vec<i64> = (0..2040).map(|_| next() as i32 as i64).collect();
         roundtrip(&pixels, &RiceParams { blocksize: 32, bytepix: 4, signed: true });
     }
 }

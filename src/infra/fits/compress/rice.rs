@@ -79,7 +79,16 @@ pub fn rice_decode(data: &[u8], nx: usize, params: &RiceParams) -> Vec<i64> {
             // high-entropy: pixels coded verbatim (no Rice split)
             while i < imax {
                 let mut k = bbits as i32 - nbits;
-                let mut diff: u32 = b << k;
+                // `k` can be exactly `bbits` (32 for BYTEPIX=4) when `nbits`
+                // is 0 -- a legitimately reachable state (large tiles with
+                // many blocks eventually land a verbatim block right on a
+                // zero-leftover-bits boundary). `b << 32` would be an
+                // invalid shift for a u32, but `b` is guaranteed to already
+                // be 0 whenever `nbits == 0` (see the `b &= (1<<nbits)-1`
+                // masking below and at the end of the fs-field consume
+                // above), so the mathematically correct contribution is 0
+                // regardless -- skip the shift rather than perform it.
+                let mut diff: u32 = if k >= 32 { 0 } else { b << k };
                 k -= 8;
                 while k >= 0 {
                     b = data[pos] as u32;

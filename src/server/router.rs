@@ -67,6 +67,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/histogram", routing::post(v2::histogram::histogram))
         // ── v2 API: render — the agent-facing PNG endpoint (issue #13) ────────
         .route("/v2/sessions/:sid/render", routing::post(v2::render::handler::render))
+        // ── v2 API: compressed FITS export/download ──────────────────────────
+        .route("/v2/sessions/:sid/export/compressed", routing::post(v2::export::export_compressed))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
 }

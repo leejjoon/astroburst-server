@@ -455,12 +455,26 @@ const RICE_DITHER_SEED: i32 = 1;
 /// the compressed image itself lives in a BINTABLE *extension* right after
 /// it (`EXTEND=T` announces that). This is a minimal, dataless (NAXIS=0)
 /// primary HDU -- exactly what astropy/fpack emit for a `CompImageHDU`.
-fn write_primary_hdu_stub(writer: &mut BufWriter<File>) -> Result<()> {
+/// `extra_header`, if given, has its non-structural cards (e.g. a source
+/// file's own `VERSION` card) copied through -- used by the MEF writer to
+/// preserve the original primary HDU's custom cards.
+pub(crate) fn write_primary_hdu_stub(
+    writer: &mut BufWriter<File>,
+    extra_header: Option<&HduHeader>,
+) -> Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     push_header_card(&mut buf, "SIMPLE", "T");
     push_header_card(&mut buf, "BITPIX", "8");
     push_header_card(&mut buf, "NAXIS", "0");
     push_header_card(&mut buf, "EXTEND", "T");
+    if let Some(hdr) = extra_header {
+        for card in &hdr.cards {
+            let key = card.0.trim();
+            if !matches!(key, "SIMPLE" | "BITPIX" | "NAXIS" | "EXTEND" | "END") {
+                push_header_card(&mut buf, key, &card.1);
+            }
+        }
+    }
     writer.write_all(&buf)?;
     write_header_end(writer, buf.len())?;
     Ok(())
@@ -500,6 +514,24 @@ fn gzip_raw_row(row: &[f32]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::default());
     enc.write_all(&raw).expect("gzip encode into a Vec<u8> sink cannot fail");
     enc.finish().expect("gzip finish into a Vec<u8> sink cannot fail")
+}
+
+/// Rice-encode raw stored integers directly, with **no** BZERO/BSCALE
+/// rescaling -- the caller supplies the source extension's own original
+/// BZERO/BSCALE (or 0.0/1.0) to `write_compressed_bintable` separately, and
+/// they're written through unchanged. This is a materially different path
+/// from `encode_int16_row` above, which is lossy *by design* (rescales
+/// arbitrary floats to fit int16 range via a freshly *computed*
+/// BZERO/BSCALE). Used for genuinely-lossless integer extensions (e.g. a
+/// bitmask/flag array) where the source data is already integer and must
+/// round-trip byte-for-byte.
+fn encode_lossless_int_row(raw: &[i64], bytepix: u32) -> EncodedRow {
+    // BITPIX=8 is FITS's one native *unsigned* integer type; 16/32 are
+    // signed two's complement (same convention `rice.rs`/`RiceParams`
+    // already document and rely on).
+    let signed = bytepix != 1;
+    let params = RiceParams { blocksize: RICE_BLOCKSIZE, bytepix, signed };
+    EncodedRow { compressed: rice_encode(raw, &params), gzip: Vec::new(), zscale: 0.0, zzero: 0.0 }
 }
 
 /// Quantize + Rice-encode one row of a float tile, falling back to a
@@ -549,6 +581,11 @@ fn write_compressed_bintable(
     zbitpix: i32,
     quantized: bool,
     has_null: bool,
+    // BLANK sentinel for the non-quantized (plain-integer) path only --
+    // `None` means no BLANK card at all (e.g. a bitmask/flag extension
+    // with no null concept). Ignored when `quantized` (that path uses
+    // ZBLANK/`NULL_VALUE`, gated on `has_null`, unconditionally).
+    blank: Option<i64>,
     bzero: f64,
     bscale: f64,
     header: Option<&HduHeader>,
@@ -607,15 +644,16 @@ fn write_compressed_bintable(
     push_header_card(&mut buf, "ZNAME1", "BLOCKSIZE");
     push_header_card(&mut buf, "ZVAL1", &RICE_BLOCKSIZE.to_string());
     push_header_card(&mut buf, "ZNAME2", "BYTEPIX");
-    push_header_card(&mut buf, "ZVAL2", if zbitpix == 16 { "2" } else { "4" });
+    let bytepix_str = match zbitpix { 8 => "1", 16 => "2", _ => "4" };
+    push_header_card(&mut buf, "ZVAL2", bytepix_str);
     if quantized {
         push_header_card(&mut buf, "ZQUANTIZ", "SUBTRACTIVE_DITHER_1");
         push_header_card(&mut buf, "ZDITHER0", &RICE_DITHER_SEED.to_string());
         if has_null {
             push_header_card(&mut buf, "ZBLANK", &NULL_VALUE.to_string());
         }
-    } else {
-        push_header_card(&mut buf, "BLANK", &I16_BLANK.to_string());
+    } else if let Some(blank_value) = blank {
+        push_header_card(&mut buf, "BLANK", &blank_value.to_string());
     }
     push_header_card(&mut buf, "BZERO", &format!("{:.10E}", bzero));
     push_header_card(&mut buf, "BSCALE", &format!("{:.10E}", bscale));
@@ -712,10 +750,10 @@ pub fn write_fits_mono_rice(
 
     let file = File::create(path).context("Failed to create FITS file")?;
     let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, file);
-    write_primary_hdu_stub(&mut writer)?;
+    write_primary_hdu_stub(&mut writer, None)?;
     write_compressed_bintable(
-        &mut writer, ncols, nrows, 1, bitpix, quantized, has_null, bzero, bscale, header,
-        &encoded_rows,
+        &mut writer, ncols, nrows, 1, bitpix, quantized, has_null, Some(I16_BLANK as i64),
+        bzero, bscale, header, &encoded_rows,
     )?;
     writer.flush()?;
     Ok(())
@@ -779,13 +817,106 @@ pub fn write_fits_rgb_rice(
 
     let file = File::create(path).context("Failed to create FITS file")?;
     let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, file);
-    write_primary_hdu_stub(&mut writer)?;
+    write_primary_hdu_stub(&mut writer, None)?;
     write_compressed_bintable(
-        &mut writer, ncols, nrows, 3, bitpix, quantized, has_null, bzero, bscale, header,
-        &encoded_rows,
+        &mut writer, ncols, nrows, 3, bitpix, quantized, has_null, Some(I16_BLANK as i64),
+        bzero, bscale, header, &encoded_rows,
     )?;
     writer.flush()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Generic N-plane building blocks for the MEF writer (`mef_writer.rs`).
+// These append ONE compressed BINTABLE extension to an already-open
+// writer -- the caller is responsible for opening the file and writing
+// the primary HDU (once) before calling either of these, and for calling
+// them once per image extension.
+// ---------------------------------------------------------------------
+
+/// Write N float32 planes as a RICE_1 tile-compressed (lossy, quantized)
+/// BINTABLE extension. Generalizes the ZNAXIS=3/ZTILE3=1 layout
+/// `write_fits_rgb_rice` hardcodes to exactly 3 planes to an arbitrary
+/// plane count -- used for cubes like a PSF (NAXIS3 != 3) as well as plain
+/// 2D images (`planes.len() == 1`).
+pub(crate) fn write_planes_quantized(
+    writer: &mut BufWriter<File>,
+    planes: &[Array2<f32>],
+    header: Option<&HduHeader>,
+    quantize_level: f64,
+) -> Result<()> {
+    let (nrows, ncols) = planes.first().context("at least one plane required")?.dim();
+    for p in &planes[1..] {
+        if p.dim() != (nrows, ncols) {
+            bail!("all planes must share the same dimensions ({ncols}x{nrows})");
+        }
+    }
+
+    let mut encoded_rows = Vec::with_capacity(nrows * planes.len());
+    let mut has_null = false;
+    let mut tile_index = 0usize;
+    for plane in planes {
+        let slice = plane.as_slice().context("plane not contiguous")?;
+        for row_i in 0..nrows {
+            let row = &slice[row_i * ncols..(row_i + 1) * ncols];
+            let (enc, null) = encode_quantized_row(row, quantize_level, tile_index);
+            has_null |= null;
+            encoded_rows.push(enc);
+            tile_index += 1;
+        }
+    }
+
+    write_compressed_bintable(
+        writer, ncols, nrows, planes.len(), -32, true, has_null, None, 0.0, 1.0, header,
+        &encoded_rows,
+    )
+}
+
+/// Write N planes of already-integer pixel data as a **losslessly**
+/// RICE_1-compressed BINTABLE extension. `raw_planes` holds the RAW stored
+/// integers (row-major, `nrows*ncols` each, NOT rescaled); `bzero`/`bscale`
+/// should be the source extension's own (unchanged) scaling; `zbitpix` is
+/// 8/16/32 and picks the Rice bytepix/signedness. `blank`, if given, is
+/// carried through as a plain `BLANK` card (e.g. from the source header's
+/// own BLANK, if it had one) -- most integer extensions (bitmasks/flags)
+/// have no null concept at all, so `None` is the common case.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_planes_lossless_int(
+    writer: &mut BufWriter<File>,
+    raw_planes: &[Vec<i64>],
+    ncols: usize,
+    nrows: usize,
+    zbitpix: i32,
+    blank: Option<i64>,
+    bzero: f64,
+    bscale: f64,
+    header: Option<&HduHeader>,
+) -> Result<()> {
+    let bytepix = match zbitpix {
+        8 => 1,
+        16 => 2,
+        32 => 4,
+        other => bail!("write_planes_lossless_int: unsupported ZBITPIX {other}"),
+    };
+
+    let mut encoded_rows = Vec::with_capacity(nrows * raw_planes.len());
+    for plane in raw_planes {
+        if plane.len() != nrows * ncols {
+            bail!(
+                "plane length {} does not match {ncols}x{nrows}",
+                plane.len()
+            );
+        }
+        for row_i in 0..nrows {
+            let row = &plane[row_i * ncols..(row_i + 1) * ncols];
+            encoded_rows.push(encode_lossless_int_row(row, bytepix));
+        }
+    }
+
+    write_compressed_bintable(
+        writer, ncols, nrows, raw_planes.len(), zbitpix, false, false, blank, bzero, bscale,
+        header, &encoded_rows,
+    )
 }
 
 #[cfg(test)]
