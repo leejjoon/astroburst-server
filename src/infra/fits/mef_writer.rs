@@ -26,7 +26,8 @@ use crate::types::constants::BLOCK_SIZE;
 use crate::types::HduHeader;
 
 use super::compress::is_compressed_image_hdu;
-use super::reader::{create_mmap, decode_pixels, parse_header_at};
+use super::file_bytes::read_file_bytes;
+use super::reader::{decode_pixels, parse_header_at};
 use super::writer::{write_planes_lossless_int, write_planes_quantized, write_primary_hdu_stub};
 
 /// One scanned HDU of the source file -- just enough to classify and
@@ -98,7 +99,7 @@ fn copy_verbatim(mmap: &[u8], writer: &mut BufWriter<File>, hdu: &SourceHdu) -> 
 /// `quantize_level` (e.g. 16.0), applied to every float image extension.
 pub fn write_compressed_mef(source_path: &str, output_path: &str, quantize_level: f64) -> Result<()> {
     let file = File::open(source_path).with_context(|| format!("Failed to open {source_path}"))?;
-    let mmap = create_mmap(&file)?;
+    let mmap = read_file_bytes(&file)?;
     let hdus = scan_source_hdus(&mmap)?;
 
     let out_file = File::create(output_path).context("Failed to create output FITS file")?;

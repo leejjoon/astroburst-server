@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Mutex;
@@ -7,10 +8,13 @@ use memmap2::Mmap;
 use ndarray::Array2;
 use rayon::prelude::*;
 
-use crate::types::constants::MAD_TO_SIGMA;
+use crate::types::constants::{BLOCK_SIZE, MAD_TO_SIGMA};
 use crate::types::HduHeader;
 use crate::math::median::f32_cmp;
-use crate::infra::fits::reader::{create_mmap_random, decode_pixels, decode_single_pixel, parse_header_at};
+use crate::infra::fits::file_bytes::{io_mode, prefer_mmap};
+use crate::infra::fits::reader::{
+    create_mmap_random, decode_pixels, decode_single_pixel, read_header_blocks,
+};
 
 #[derive(Debug, Clone)]
 pub struct CubeGeometry {
@@ -112,9 +116,43 @@ pub struct LazyCubeResult {
 const DEFAULT_CACHE_SIZE: usize = 64;
 const BATCH_SIZE: usize = 32;
 
+/// Where the cube's raw bytes come from. `Mapped` (random-access mmap) is
+/// the local-filesystem default; `File` uses positional `pread` reads
+/// (`read_exact_at`) and is chosen on network mounts / `ASTROBURST_IO_MODE=
+/// read`, where mmap page faults risk SIGBUS and defeat client readahead.
+/// A full-file read is deliberately NOT offered here -- the lazy cube's
+/// whole purpose is touching a small fraction of potentially-huge files.
+enum CubeSource {
+    Mapped(Mmap),
+    File(File),
+}
+
+impl CubeSource {
+    /// Fetch `len` bytes at absolute file offset `start`: a zero-copy
+    /// borrow from the mapping, or an owned pread buffer. `read_exact_at`
+    /// is positional (no shared cursor), so concurrent use from rayon
+    /// workers is safe on both variants.
+    fn read_range(&self, start: usize, len: usize) -> Result<Cow<'_, [u8]>> {
+        match self {
+            CubeSource::Mapped(m) => Ok(Cow::Borrowed(&m[start..start + len])),
+            #[cfg(unix)]
+            CubeSource::File(f) => {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0u8; len];
+                f.read_exact_at(&mut buf, start as u64)
+                    .with_context(|| format!("pread of {len} bytes at offset {start} failed"))?;
+                Ok(Cow::Owned(buf))
+            }
+            // The File variant is never constructed on non-unix (see
+            // `open_with_cache`); there is no portable positional read.
+            #[cfg(not(unix))]
+            CubeSource::File(_) => bail!("pread cube source is unix-only"),
+        }
+    }
+}
+
 pub struct LazyCube {
-    _file: File,
-    mmap: Mmap,
+    source: CubeSource,
     pub header: HduHeader,
     pub geometry: CubeGeometry,
     cache: Mutex<LruFrameCache>,
@@ -142,14 +180,25 @@ impl LazyCube {
     }
 
     pub fn open_with_cache(path: &str, cache_frames: usize) -> Result<Self> {
+        Self::open_with_options(path, cache_frames, io_mode())
+    }
+
+    /// Mode-explicit variant of [`Self::open_with_cache`], used by tests
+    /// (the env-driven [`io_mode`] is cached process-wide).
+    pub fn open_with_options(
+        path: &str,
+        cache_frames: usize,
+        mode: crate::infra::fits::file_bytes::IoMode,
+    ) -> Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("Failed to open FITS file {}", path))?;
-        let mmap = create_mmap_random(&file)
-            .context("mmap failed for lazy cube")?;
+        let file_len = file.metadata().context("stat failed")?.len() as usize;
 
+        // Header walk via seek+read (a few KB) -- no mapping needed to
+        // locate the cube HDU, regardless of which source we end up using.
         let mut offset: usize = 0;
-        while offset < mmap.len() {
-            let parsed = parse_header_at(&mmap, offset)
+        while offset + BLOCK_SIZE <= file_len {
+            let parsed = read_header_blocks(&file, offset)
                 .context("Header parse failed in lazy cube")?;
             let header = parsed.header;
 
@@ -179,10 +228,10 @@ impl LazyCube {
                 let data_end = data_offset
                     .checked_add(total_bytes)
                     .context("Cube data end overflow")?;
-                if data_end > mmap.len() {
+                if data_end > file_len {
                     bail!(
                         "Cube data [{}, {}) exceeds file size {}",
-                        data_offset, data_end, mmap.len()
+                        data_offset, data_end, file_len
                     );
                 }
 
@@ -195,8 +244,17 @@ impl LazyCube {
                     data_offset, frame_bytes,
                 };
 
+                // pread (File) source is unix-only; elsewhere always map.
+                let source = if !cfg!(unix) || prefer_mmap(&file, mode) {
+                    CubeSource::Mapped(
+                        create_mmap_random(&file).context("mmap failed for lazy cube")?,
+                    )
+                } else {
+                    CubeSource::File(file)
+                };
+
                 return Ok(LazyCube {
-                    _file: file, mmap, header, geometry,
+                    source, header, geometry,
                     cache: Mutex::new(LruFrameCache::new(cache_frames)),
                 });
             }
@@ -221,10 +279,9 @@ impl LazyCube {
 
         let g = &self.geometry;
         let start = g.data_offset + z * g.frame_bytes;
-        let end = start + g.frame_bytes;
-        let raw = &self.mmap[start..end];
+        let raw = self.source.read_range(start, g.frame_bytes)?;
 
-        let pixels = decode_pixels(raw, g.bitpix, g.bscale, g.bzero);
+        let pixels = decode_pixels(&raw, g.bitpix, g.bscale, g.bzero);
         let frame = Array2::from_shape_vec((g.naxis2, g.naxis1), pixels)
             .context("Failed to reshape frame pixels")?;
 
@@ -236,12 +293,11 @@ impl LazyCube {
         Ok(frame)
     }
 
-    fn decode_frame_nocache(&self, z: usize) -> Vec<f32> {
+    fn decode_frame_nocache(&self, z: usize) -> Result<Vec<f32>> {
         let g = &self.geometry;
         let start = g.data_offset + z * g.frame_bytes;
-        let end = start + g.frame_bytes;
-        let raw = &self.mmap[start..end];
-        decode_pixels(raw, g.bitpix, g.bscale, g.bzero)
+        let raw = self.source.read_range(start, g.frame_bytes)?;
+        Ok(decode_pixels(&raw, g.bitpix, g.bscale, g.bzero))
     }
 
     pub fn extract_spectrum_at(&self, y: usize, x: usize) -> Result<Vec<f32>> {
@@ -253,10 +309,13 @@ impl LazyCube {
         let pixel_offset_in_frame = (y * g.naxis1 + x) * g.bytes_per_pixel;
         let mut spectrum = Vec::with_capacity(g.naxis3);
 
+        // On the pread source this is one positional read per plane
+        // (~naxis3 syscalls) -- acceptable for typical cube depths, and
+        // still far cheaper over a network mount than faulting pages in.
         for z in 0..g.naxis3 {
             let abs_offset = g.data_offset + z * g.frame_bytes + pixel_offset_in_frame;
-            let raw = &self.mmap[abs_offset..abs_offset + g.bytes_per_pixel];
-            let val = decode_single_pixel(raw, g.bitpix, g.bscale, g.bzero);
+            let raw = self.source.read_range(abs_offset, g.bytes_per_pixel)?;
+            let val = decode_single_pixel(&raw, g.bitpix, g.bscale, g.bzero);
             spectrum.push(val);
         }
 
@@ -284,7 +343,7 @@ impl LazyCube {
             let frames: Vec<Vec<f32>> = (batch_start..batch_end)
                 .into_par_iter()
                 .map(|z| self.decode_frame_nocache(z))
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             for frame_idx in 0..batch_count {
                 let pixels = &frames[frame_idx];
@@ -325,7 +384,7 @@ impl LazyCube {
             let frames: Vec<Vec<f32>> = (batch_start..batch_end)
                 .into_par_iter()
                 .map(|z| self.decode_frame_nocache(z))
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
             for pixels in &frames {
                 for i in 0..npix {
@@ -362,11 +421,11 @@ impl LazyCube {
         let indices: Vec<usize> = (0..g.naxis3).step_by(step).collect();
         let frame_samples: Vec<Vec<f32>> = indices
             .par_iter()
-            .map(|&z| {
-                let pixels = self.decode_frame_nocache(z);
-                pixels.into_iter().filter(|v| v.is_finite() && *v != 0.0).collect()
+            .map(|&z| -> Result<Vec<f32>> {
+                let pixels = self.decode_frame_nocache(z)?;
+                Ok(pixels.into_iter().filter(|v| v.is_finite() && *v != 0.0).collect())
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let mut sampled: Vec<f32> = Vec::new();
         for chunk in frame_samples {
@@ -500,5 +559,68 @@ mod tests {
         assert!(checked_cube_bytes(usize::MAX, 2, 1, 1).is_err());
         assert!(checked_cube_bytes(1 << 40, 1 << 40, 1, 1).is_err());
         assert!(checked_cube_bytes(4, 4, usize::MAX, 1).is_err());
+    }
+
+    /// Write a minimal 3D float32 cube FITS file for source-parity testing.
+    fn write_test_cube(path: &std::path::Path, w: usize, h: usize, d: usize) {
+        let mut buf = Vec::new();
+        for (k, v) in [
+            ("SIMPLE", "T".to_string()),
+            ("BITPIX", "-32".into()),
+            ("NAXIS", "3".into()),
+            ("NAXIS1", w.to_string()),
+            ("NAXIS2", h.to_string()),
+            ("NAXIS3", d.to_string()),
+        ] {
+            let mut card = format!("{k:<8}= {v}").into_bytes();
+            card.resize(80, b' ');
+            buf.extend_from_slice(&card);
+        }
+        let mut end = b"END".to_vec();
+        end.resize(80, b' ');
+        buf.extend_from_slice(&end);
+        while buf.len() % BLOCK_SIZE != 0 {
+            buf.push(b' ');
+        }
+        for i in 0..(w * h * d) {
+            buf.extend_from_slice(&(i as f32 * 0.25 - 3.0).to_be_bytes());
+        }
+        while buf.len() % BLOCK_SIZE != 0 {
+            buf.push(0);
+        }
+        std::fs::write(path, &buf).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pread_source_matches_mapped_source() {
+        use crate::infra::fits::file_bytes::IoMode;
+
+        let path = std::env::temp_dir().join("ab_lazy_cube_source_parity.fits");
+        write_test_cube(&path, 7, 5, 4);
+        let p = path.to_str().unwrap();
+
+        let mapped = LazyCube::open_with_options(p, 4, IoMode::Mmap).unwrap();
+        let pread = LazyCube::open_with_options(p, 4, IoMode::Read).unwrap();
+        assert!(matches!(mapped.source, CubeSource::Mapped(_)));
+        assert!(matches!(pread.source, CubeSource::File(_)));
+
+        for z in 0..4 {
+            assert_eq!(
+                mapped.get_frame(z).unwrap(),
+                pread.get_frame(z).unwrap(),
+                "frame {z}"
+            );
+        }
+        assert_eq!(
+            mapped.extract_spectrum_at(3, 6).unwrap(),
+            pread.extract_spectrum_at(3, 6).unwrap()
+        );
+        assert_eq!(
+            mapped.collapse_mean_lazy().unwrap(),
+            pread.collapse_mean_lazy().unwrap()
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
