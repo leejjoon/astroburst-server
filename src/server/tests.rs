@@ -37,6 +37,12 @@ async fn health_returns_ok() {
     assert!(json["version"].is_string());
     assert!(json["sessions_active"].is_number());
     assert!(json["sessions_total"].is_number());
+    // Configured FITS byte-source policy (per-file resolution is on open).
+    assert!(
+        ["auto", "mmap", "read"].contains(&json["io_mode"].as_str().unwrap()),
+        "unexpected io_mode: {:?}",
+        json["io_mode"]
+    );
 }
 
 // ── 2. X-Request-Id pass-through ─────────────────────────────────────────────
@@ -450,6 +456,12 @@ async fn v2_open_returns_dims_stats_wcs_and_lists_ref() {
     assert_eq!(json["wcs_present"], true);
     assert!(json["stats"]["median"].is_number());
     assert!(json["header"]["CTYPE1"].is_string());
+    // Resolved per-file byte-source decision for the opened path.
+    assert!(
+        ["mmap", "read"].contains(&json["io"].as_str().unwrap()),
+        "unexpected io: {:?}",
+        json["io"]
+    );
 
     // GET /images should now list img_0 as the (only, active) ref.
     let resp = build_router(state)

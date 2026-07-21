@@ -80,6 +80,10 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "sessions_active": state.sessions.len(),
         "sessions_total": state.created_total.load(Ordering::Relaxed),
+        // Configured FITS byte-source policy (ASTROBURST_IO_MODE). Under
+        // "auto" the per-file outcome is reported by the open/hdu responses'
+        // "io" field instead, since it depends on the file's filesystem.
+        "io_mode": astroburst_lib::infra::fits::file_bytes::io_mode().as_str(),
     }))
 }
 

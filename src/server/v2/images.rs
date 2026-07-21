@@ -18,6 +18,7 @@ use astroburst_lib::infra::asdf::converter::is_asdf_file;
 use astroburst_lib::infra::asdf_bridge::extract_image_from_asdf;
 use astroburst_lib::infra::cache::ImageEntry;
 use astroburst_lib::infra::fits::dispatcher::resolve_single_image;
+use astroburst_lib::infra::fits::file_bytes::resolved_io_for_file;
 use astroburst_lib::infra::fits::reader::{extract_image_mmap, extract_image_mmap_by_index};
 use astroburst_lib::types::header::HduHeader;
 use astroburst_lib::types::ImageStats;
@@ -74,6 +75,19 @@ fn load_by_index(path: &str, hdu: usize) -> anyhow::Result<(Array2<f32>, ImageSt
     let r = extract_image_mmap_by_index(&file, hdu)?;
     let stats = compute_image_stats(&r.image);
     Ok((r.image, stats, r.header))
+}
+
+/// The byte-source ("mmap"|"read") the FITS I/O policy resolves to for
+/// `path`'s filesystem, for the response's `io` field. A policy indicator,
+/// not a byte-level trace: ZIP-wrapped inputs are extracted to local tmp
+/// before the FITS read, and ASDF doesn't use the FITS byte-source at all.
+/// `null` if the path can't be re-opened (shouldn't happen right after a
+/// successful load).
+fn resolved_io_json(path: &str) -> Value {
+    match File::open(path) {
+        Ok(f) => json!(resolved_io_for_file(&f)),
+        Err(_) => Value::Null,
+    }
 }
 
 fn stats_json(s: &ImageStats) -> Value {
@@ -158,7 +172,9 @@ pub async fn open(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("task panic: {e}")))?
     .map_err(AppError::Internal)?;
 
-    let body = register_and_respond(&session, image_ref.clone(), Some(params.path), hdu, &entry);
+    let mut body =
+        register_and_respond(&session, image_ref.clone(), Some(params.path.clone()), hdu, &entry);
+    body["io"] = resolved_io_json(&params.path);
     *session.v2.active_ref.write().await = Some(image_ref);
     Ok(Json(body))
 }
@@ -203,7 +219,9 @@ pub async fn switch_hdu(
     .map_err(|e| AppError::Internal(anyhow::anyhow!("task panic: {e}")))?
     .map_err(AppError::Internal)?;
 
-    let body = register_and_respond(&session, image_ref.clone(), Some(source), Some(hdu), &entry);
+    let mut body =
+        register_and_respond(&session, image_ref.clone(), Some(source.clone()), Some(hdu), &entry);
+    body["io"] = resolved_io_json(&source);
     *session.v2.active_ref.write().await = Some(image_ref);
     Ok(Json(body))
 }

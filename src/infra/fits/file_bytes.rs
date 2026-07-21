@@ -39,6 +39,16 @@ pub enum IoMode {
     Read,
 }
 
+impl IoMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IoMode::Auto => "auto",
+            IoMode::Mmap => "mmap",
+            IoMode::Read => "read",
+        }
+    }
+}
+
 impl FromStr for IoMode {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -96,6 +106,19 @@ pub(crate) fn prefer_mmap(file: &File, mode: IoMode) -> bool {
         IoMode::Mmap => true,
         IoMode::Read => false,
         IoMode::Auto => !is_network_fs(file),
+    }
+}
+
+/// Resolve which byte-source the current policy would pick for `file`:
+/// `"mmap"` or `"read"`. Cheap (at most one `fstatfs`) and deterministic --
+/// exists so the server can report the per-file decision to clients (the
+/// configured policy alone doesn't reveal the outcome under `auto`, which
+/// depends on the filesystem the file lives on).
+pub fn resolved_io_for_file(file: &File) -> &'static str {
+    if prefer_mmap(file, io_mode()) {
+        "mmap"
+    } else {
+        "read"
     }
 }
 
