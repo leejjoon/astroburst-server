@@ -5,13 +5,47 @@ reconstruct the original (uncompressed) multi-extension file from it.
 Usage:
     python compressed_mef_client.py <source_path_on_server> <output.fits> [quantize_level]
 
-Requires: requests, astropy
+The server can be addressed directly (http://...) or through an
+app-managed SSH tunnel (ssh://host or an ~/.ssh/config alias via
+BASE_URL="ssh://olaf1"), which spawns `astroburst-server connect --json`
+under the hood -- see remote_server() and issue #2.
+
+Requires: requests, astropy (and the astroburst-server binary on PATH
+for ssh:// targets)
 """
 
+import contextlib
+import json
+import subprocess
 import sys
 
 import requests
 from astropy.io import fits
+
+
+@contextlib.contextmanager
+def remote_server(ssh_target: str, binary: str = "astroburst-server"):
+    """Yield a local base URL for a remote server reached over SSH.
+
+    Spawns `astroburst-server connect <target> --json`, which picks a free
+    local port, establishes the tunnel (reusing your ~/.ssh/config, keys,
+    and agent), health-checks the remote server, and auto-reconnects on
+    drops. The tunnel lives for the duration of the `with` block.
+    """
+    proc = subprocess.Popen(
+        [binary, "connect", ssh_target, "--json"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        line = proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f"connect exited without output (target {ssh_target!r})")
+        info = json.loads(line)
+        yield info["url"]
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 def fetch_compressed_fits(
@@ -94,11 +128,21 @@ if __name__ == "__main__":
     output_path = sys.argv[2]
     quantize_level = float(sys.argv[3]) if len(sys.argv) > 3 else None
 
-    base_url = "http://127.0.0.1:18099"
+    import os
 
-    compressed_path = output_path + ".compressed"
-    fetch_compressed_fits(base_url, source_path, compressed_path, quantize_level)
-    print(f"Downloaded compressed file: {compressed_path}")
+    # http://host:port for a directly reachable server, or ssh://target /
+    # ssh-config alias for an app-managed tunnel.
+    base_url = os.environ.get("BASE_URL", "http://127.0.0.1:8080")
 
-    reconstruct_mef(compressed_path, output_path)
-    print(f"Reconstructed uncompressed file: {output_path}")
+    def run(url: str):
+        compressed_path = output_path + ".compressed"
+        fetch_compressed_fits(url, source_path, compressed_path, quantize_level)
+        print(f"Downloaded compressed file: {compressed_path}")
+        reconstruct_mef(compressed_path, output_path)
+        print(f"Reconstructed uncompressed file: {output_path}")
+
+    if base_url.startswith("ssh://"):
+        with remote_server(base_url) as url:
+            run(url)
+    else:
+        run(base_url)

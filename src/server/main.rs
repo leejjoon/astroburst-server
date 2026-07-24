@@ -1,4 +1,5 @@
 mod config;
+mod connect;
 mod error;
 mod extractors;
 mod handlers;
@@ -15,8 +16,19 @@ use std::sync::Arc;
 
 use config::ServerConfig;
 
+fn main() -> anyhow::Result<()> {
+    // Client-side subcommand: `astroburst-server connect <ssh-target>`
+    // manages an SSH tunnel to a remote (loopback-bound) server instance
+    // and never starts the HTTP server itself (issue #2).
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("connect") {
+        return connect::run(&args[2..]);
+    }
+    serve()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     let cfg = Arc::new(ServerConfig::from_env());
 
     // Initialise the logger. Honour RUST_LOG if already set, otherwise use
