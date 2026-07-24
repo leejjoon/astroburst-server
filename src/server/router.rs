@@ -37,12 +37,19 @@ pub fn build_router(state: AppState) -> Router {
         // T12 — Pipeline
         .route("/sessions/:sid/pipeline/run", routing::post(pipeline::run))
         // ── v2 API: sessions & image lifecycle (issue #2) ────────────────────
-        // Session creation reuses the v1 handler verbatim.
-        .route("/v2/sessions", routing::post(sessions::create))
+        // Session creation reuses the v1 handler verbatim; GET lists live
+        // sessions for dashboards (issue #3).
+        .route(
+            "/v2/sessions",
+            routing::post(sessions::create).get(v2::sessions::list),
+        )
         .route(
             "/v2/sessions/:sid",
             get(v2::sessions::status).delete(v2::sessions::delete),
         )
+        // Per-session activity ring (issue #3) — fed by the activity
+        // middleware below, excluded from its own recording.
+        .route("/v2/sessions/:sid/history", get(v2::sessions::history))
         .route("/v2/sessions/:sid/keepalive", routing::post(v2::sessions::keepalive))
         .route("/v2/sessions/:sid/open", routing::post(v2::images::open))
         .route("/v2/sessions/:sid/hdu", routing::post(v2::images::switch_hdu))
@@ -69,6 +76,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/render", routing::post(v2::render::handler::render))
         // ── v2 API: compressed FITS export/download ──────────────────────────
         .route("/v2/sessions/:sid/export/compressed", routing::post(v2::export::export_compressed))
+        // Record session-scoped requests into the session's activity ring
+        // (issue #3). Layered before with_state consumes `state`.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            super::activity::record_activity,
+        ))
         .with_state(state)
         .layer(middleware::from_fn(request_id))
 }

@@ -1794,3 +1794,145 @@ async fn v2_render_unknown_colormap_and_stretch_are_bad_request() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
+
+// ── issue #3 Phase 0: sessions list + per-session activity history ───────────
+
+/// GET helper mirroring `post_json`.
+async fn get_resp(app: axum::Router, uri: &str) -> axum::response::Response {
+    app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn v2_sessions_list_reports_summaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let fits = dir.path().join("wcs.fits");
+    v2_fixtures::write_wcs_fits(&fits, 8, 8);
+
+    let state = AppState::new(cfg());
+    seed_session(&state, "s-list-a");
+    seed_session(&state, "s-list-b");
+    post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-list-b/open",
+        &format!(r#"{{"path":"{}"}}"#, fits.to_str().unwrap()),
+    )
+    .await;
+
+    let resp = get_resp(build_router(state), "/v2/sessions").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["count"], 2);
+
+    let sessions = json["sessions"].as_array().unwrap();
+    let by_id = |id: &str| {
+        sessions
+            .iter()
+            .find(|s| s["session_id"] == id)
+            .unwrap_or_else(|| panic!("session {id} missing from list"))
+    };
+
+    let a = by_id("s-list-a");
+    assert_eq!(a["image_count"], 0);
+    assert_eq!(a["active_ref"], serde_json::Value::Null);
+    assert_eq!(a["running_jobs"], 0);
+    assert_eq!(a["last_seq"], 0);
+    assert!(a["created_unix"].as_u64().unwrap() > 0);
+    assert!(a["idle_secs"].is_number());
+    assert!(a["cache_bytes"].is_number());
+
+    let b = by_id("s-list-b");
+    assert_eq!(b["image_count"], 1);
+    assert_eq!(b["active_ref"], "img_0");
+    // The `open` was recorded into the activity ring.
+    assert_eq!(b["last_seq"], 1);
+}
+
+#[tokio::test]
+async fn v2_history_records_work_and_skips_observability_polls() {
+    let (state, _dir) = seed_wcs_session("s-hist").await;
+
+    post_json(
+        build_router(state.clone()),
+        "/v2/sessions/s-hist/wcs/pix2sky",
+        r#"{"points":[[3,3]]}"#,
+    )
+    .await;
+
+    // A dashboard's polling loop: status, images, history. None recorded.
+    get_resp(build_router(state.clone()), "/v2/sessions/s-hist").await;
+    get_resp(build_router(state.clone()), "/v2/sessions/s-hist/images").await;
+    get_resp(build_router(state.clone()), "/v2/sessions/s-hist/history").await;
+
+    let resp = get_resp(build_router(state), "/v2/sessions/s-hist/history").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["session_id"], "s-hist");
+    assert_eq!(json["last_seq"], 2);
+
+    let events = json["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+
+    assert_eq!(events[0]["seq"], 1);
+    assert_eq!(events[0]["endpoint"], "open");
+    assert_eq!(events[0]["method"], "POST");
+    assert_eq!(events[0]["status"], 200);
+    // No body ref on open — attributed to the ref it created.
+    assert_eq!(events[0]["image_ref"], "img_0");
+    assert!(events[0]["unix_ms"].as_u64().unwrap() > 0);
+    assert!(events[0]["duration_ms"].is_number());
+
+    assert_eq!(events[1]["seq"], 2);
+    assert_eq!(events[1]["endpoint"], "wcs/pix2sky");
+}
+
+#[tokio::test]
+async fn v2_history_since_seq_filters_and_records_failed_requests() {
+    let (state, _dir) = seed_wcs_session("s-seq").await;
+
+    // Explicit body ref on a failing request: sniffed from the body (the
+    // request carries content-length) and recorded with the error status.
+    let body = r#"{"image_ref":"ghost"}"#;
+    let resp = build_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v2/sessions/s-seq/stats")
+                .header("content-type", "application/json")
+                .header("content-length", body.len())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = get_resp(
+        build_router(state.clone()),
+        "/v2/sessions/s-seq/history?since_seq=1",
+    )
+    .await;
+    let json = body_json(resp).await;
+    assert_eq!(json["last_seq"], 2);
+    let events = json["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["seq"], 2);
+    assert_eq!(events[0]["endpoint"], "stats");
+    assert_eq!(events[0]["status"], 404);
+    assert_eq!(events[0]["image_ref"], "ghost");
+
+    // limit keeps the newest events.
+    let resp = get_resp(
+        build_router(state.clone()),
+        "/v2/sessions/s-seq/history?limit=1",
+    )
+    .await;
+    let json = body_json(resp).await;
+    assert_eq!(json["events"].as_array().unwrap().len(), 1);
+    assert_eq!(json["events"][0]["seq"], 2);
+
+    // Unknown session → 404.
+    let resp = get_resp(build_router(state), "/v2/sessions/no-such/history").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

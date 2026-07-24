@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use serde::Serialize;
@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use astroburst_lib::infra::cache::ImageCache;
 
+use super::activity::ActivityLog;
 use super::config::ServerConfig;
 use super::job::{Job, JobId};
 
@@ -69,6 +70,10 @@ pub struct Session {
     pub cache: Arc<ImageCache>,
     pub jobs: DashMap<JobId, Arc<Job>>,
     pub v2: V2SessionState,
+    /// Bounded ring of recent requests against this session (issue #3).
+    pub activity: ActivityLog,
+    /// Wall-clock creation time, seconds since the unix epoch (for clients).
+    pub created_unix: u64,
     last_accessed: RwLock<Instant>,
 }
 
@@ -79,12 +84,27 @@ impl Session {
             cache: Arc::new(ImageCache::new(cfg.cache_max_entries, cfg.cache_max_bytes)),
             jobs: DashMap::new(),
             v2: V2SessionState::new(),
+            activity: ActivityLog::new(),
+            created_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             last_accessed: RwLock::new(Instant::now()),
         })
     }
 
     pub async fn touch(&self) {
         *self.last_accessed.write().await = Instant::now();
+    }
+
+    /// Seconds since the last request touched this session.
+    pub async fn idle_secs(&self) -> u64 {
+        self.last_accessed.read().await.elapsed().as_secs()
+    }
+
+    /// Number of jobs currently in the Running state.
+    pub fn running_jobs(&self) -> usize {
+        self.jobs.iter().filter(|e| e.value().is_running()).count()
     }
 
     /// True when any job is still running. The TTL cleaner skips such sessions.
