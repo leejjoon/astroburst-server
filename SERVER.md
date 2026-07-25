@@ -74,8 +74,11 @@ All knobs are set via environment variables. Unset variables use the defaults sh
 | `ASTROBURST_CACHE_MAX_BYTES` | `2147483648` | Per-session image cache memory limit (bytes) |
 | `ASTROBURST_CLEANUP_INTERVAL` | `60` | Seconds between idle-session sweep runs |
 | `ASTROBURST_LOG_LEVEL` | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`) |
+| `RAYON_NUM_THREADS` | all logical cores | Threads for parallel CPU work — image compression/decompression and rendering |
 
 `RUST_LOG` takes precedence over `ASTROBURST_LOG_LEVEL` when both are set.
+
+`RAYON_NUM_THREADS` is a standard [rayon](https://docs.rs/rayon) variable, read once at startup, and is process-wide: it caps the thread pool shared by all parallel CPU work (e.g. RICE_1 compression on `POST /v2/.../export/compressed`, tile decompression, render pixel math). Set it to bound total CPU on a shared host; `RAYON_NUM_THREADS=1` forces fully sequential execution. Unset (the default) uses one thread per logical core.
 
 Example — run with tighter limits and verbose logging:
 

@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ndarray::Array2;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
@@ -852,19 +853,28 @@ pub(crate) fn write_planes_quantized(
         }
     }
 
-    let mut encoded_rows = Vec::with_capacity(nrows * planes.len());
-    let mut has_null = false;
-    let mut tile_index = 0usize;
-    for plane in planes {
-        let slice = plane.as_slice().context("plane not contiguous")?;
-        for row_i in 0..nrows {
+    // Validate contiguity up front (fallibly, sequentially) so the parallel
+    // encode below can index the slices without any `?` in the hot loop.
+    let slices: Vec<&[f32]> = planes
+        .iter()
+        .map(|p| p.as_slice().context("plane not contiguous"))
+        .collect::<Result<_>>()?;
+
+    // Each row is an independent Rice tile whose dither seed is exactly its
+    // global `tile_index` (plane-major), so mapping over a flat index range
+    // and collecting preserves both order and per-row seeds. Rayon's
+    // IndexedParallelIterator keeps the output in index order.
+    let encoded: Vec<(EncodedRow, bool)> = (0..slices.len() * nrows)
+        .into_par_iter()
+        .map(|tile_index| {
+            let slice = slices[tile_index / nrows];
+            let row_i = tile_index % nrows;
             let row = &slice[row_i * ncols..(row_i + 1) * ncols];
-            let (enc, null) = encode_quantized_row(row, quantize_level, tile_index);
-            has_null |= null;
-            encoded_rows.push(enc);
-            tile_index += 1;
-        }
-    }
+            encode_quantized_row(row, quantize_level, tile_index)
+        })
+        .collect();
+    let has_null = encoded.iter().any(|(_, null)| *null);
+    let encoded_rows: Vec<EncodedRow> = encoded.into_iter().map(|(enc, _)| enc).collect();
 
     write_compressed_bintable(
         writer, ncols, nrows, planes.len(), -32, true, has_null, None, 0.0, 1.0, header,
@@ -899,7 +909,8 @@ pub(crate) fn write_planes_lossless_int(
         other => bail!("write_planes_lossless_int: unsupported ZBITPIX {other}"),
     };
 
-    let mut encoded_rows = Vec::with_capacity(nrows * raw_planes.len());
+    // Validate plane sizes up front (fallibly, sequentially) so the parallel
+    // encode below stays `?`-free.
     for plane in raw_planes {
         if plane.len() != nrows * ncols {
             bail!(
@@ -907,11 +918,19 @@ pub(crate) fn write_planes_lossless_int(
                 plane.len()
             );
         }
-        for row_i in 0..nrows {
-            let row = &plane[row_i * ncols..(row_i + 1) * ncols];
-            encoded_rows.push(encode_lossless_int_row(row, bytepix));
-        }
     }
+
+    // Rows are independent Rice tiles; encode them in parallel. Collecting a
+    // flat plane-major index range preserves the original row order.
+    let encoded_rows: Vec<EncodedRow> = (0..raw_planes.len() * nrows)
+        .into_par_iter()
+        .map(|idx| {
+            let plane = &raw_planes[idx / nrows];
+            let row_i = idx % nrows;
+            let row = &plane[row_i * ncols..(row_i + 1) * ncols];
+            encode_lossless_int_row(row, bytepix)
+        })
+        .collect();
 
     write_compressed_bintable(
         writer, ncols, nrows, raw_planes.len(), zbitpix, false, false, blank, bzero, bscale,
