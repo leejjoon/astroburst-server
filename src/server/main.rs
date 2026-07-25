@@ -8,6 +8,7 @@ mod job;
 mod router;
 mod session;
 mod state;
+mod tui;
 mod v2;
 
 #[cfg(test)]
@@ -18,12 +19,16 @@ use std::sync::Arc;
 use config::ServerConfig;
 
 fn main() -> anyhow::Result<()> {
-    // Client-side subcommand: `astroburst-server connect <ssh-target>`
-    // manages an SSH tunnel to a remote (loopback-bound) server instance
-    // and never starts the HTTP server itself (issue #2).
+    // Client-side subcommands that never start the HTTP server:
+    // - `connect <ssh-target>` manages an SSH tunnel to a remote
+    //   (loopback-bound) server instance (issue #2);
+    // - `tui [URL]` runs the live dashboard against a local/direct server
+    //   (issue #3; `connect ... --tui` covers remote ones).
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("connect") {
-        return connect::run(&args[2..]);
+    match args.get(1).map(String::as_str) {
+        Some("connect") => return connect::run(&args[2..]),
+        Some("tui") => return tui::run_standalone(&args[2..]),
+        _ => {}
     }
     serve()
 }

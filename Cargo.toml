@@ -24,6 +24,9 @@ dashmap = { version = "6", optional = true }
 uuid = { version = "1", features = ["v4"], optional = true }
 tokio-stream = { version = "0.1", optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
+# TUI dashboard (issue #3) — crossterm comes via the ratatui re-export so the
+# two can never drift out of version sync.
+ratatui = { version = "0.29", optional = true }
 
 # Always-on shared deps
 tokio = { version = "1", features = ["full"] }
@@ -67,7 +70,10 @@ libc = "0.2"
 default = ["tauri", "astrometry-net", "asdf-full", "vizier"]
 tauri = ["dep:tauri", "dep:tauri-plugin-dialog", "dep:tauri-plugin-fs", "dep:tauri-plugin-shell", "dep:tauri-plugin-opener"]
 # Headless HTTP server — build with: cargo build --no-default-features --features server,astrometry-net,asdf-full,vizier
-server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:dashmap", "dep:uuid", "dep:tokio-stream", "dep:tokio-util", "dep:env_logger"]
+server = ["dep:axum", "dep:tower", "dep:tower-http", "dep:dashmap", "dep:uuid", "dep:tokio-stream", "dep:tokio-util", "dep:env_logger", "tui"]
+# TUI dashboard (`tui` subcommand / `connect --tui`, issue #3). Folded into
+# `server` so the release binary always ships it.
+tui = ["dep:ratatui"]
 astrometry-net = ["dep:reqwest"]
 vizier = ["reqwest/blocking"]
 asdf-full = ["dep:bzip2", "dep:lz4_flex"]

@@ -23,9 +23,10 @@
 //!   exponential backoff **on the same local port**, so the URL handed to
 //!   clients stays valid across network blips.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -41,6 +42,7 @@ const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// slow auth / 2FA-less key exchange on distant hosts).
 const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[derive(Debug)]
 pub struct ConnectOptions {
     pub target: SshTarget,
     pub remote_port: u16,
@@ -54,6 +56,28 @@ pub struct ConnectOptions {
     pub start: bool,
     /// Remote binary (path or $PATH name) used by `--start`.
     pub remote_bin: String,
+    /// Run the live dashboard instead of the plain CLI supervisor (issue #3).
+    pub tui: bool,
+}
+
+/// Status stream from the tunnel supervisor. The CLI prints these; the TUI
+/// renders them in its Tunnel pane. Nothing in `supervise` writes to
+/// stdout/stderr directly — under `--tui` the alternate screen owns the
+/// terminal and any stray print (including ssh's own stderr) would corrupt it.
+#[derive(Debug)]
+pub enum TunnelEvent {
+    /// Healthy `/health` through the tunnel. `reestablished` distinguishes
+    /// the first announce (the CLI's `--json` line) from a reconnect.
+    Up { health: String, reestablished: bool },
+    /// `--start` is launching the remote server.
+    StartingRemote { bin: String, dest: String },
+    /// The tunnel died or failed to come up; next attempt after `backoff`.
+    /// `reason` is human-readable and carries the attempt count when relevant.
+    Retrying { backoff: Duration, reason: String },
+    /// A line of ssh's stderr (banners, auth errors, keepalive timeouts).
+    SshLine(String),
+    /// Supervision is over; `supervise` returns Err with the same reason.
+    Fatal { reason: String },
 }
 
 /// An SSH destination: either a bare word delegated entirely to OpenSSH
@@ -99,6 +123,7 @@ pub fn parse_args(args: &[String]) -> Result<ConnectOptions> {
     let mut max_retries = None;
     let mut start = false;
     let mut remote_bin = "astroburst-server".to_string();
+    let mut tui = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -123,10 +148,11 @@ pub fn parse_args(args: &[String]) -> Result<ConnectOptions> {
             }
             "--start" => start = true,
             "--remote-bin" => remote_bin = take_value("--remote-bin")?,
+            "--tui" => tui = true,
             "--help" | "-h" => {
                 bail!(
                     "usage: astroburst-server connect <ssh-target> \
-                     [--remote-port N] [--local-port N] [--json] \
+                     [--remote-port N] [--local-port N] [--json] [--tui] \
                      [--no-reconnect] [--max-retries N] [--start] [--remote-bin PATH]\n\
                      <ssh-target>: an ~/.ssh/config alias/hostname, or ssh://user@host[:sshport]"
                 );
@@ -134,6 +160,10 @@ pub fn parse_args(args: &[String]) -> Result<ConnectOptions> {
             other if target.is_none() => target = Some(parse_target(other)?),
             other => bail!("unexpected argument '{other}'"),
         }
+    }
+
+    if json && tui {
+        bail!("--json and --tui are mutually exclusive");
     }
 
     Ok(ConnectOptions {
@@ -145,6 +175,7 @@ pub fn parse_args(args: &[String]) -> Result<ConnectOptions> {
         max_retries,
         start,
         remote_bin,
+        tui,
     })
 }
 
@@ -242,15 +273,20 @@ fn await_health(local_port: u16, deadline: Instant) -> ProbeResult {
     last
 }
 
-fn spawn_tunnel(opts: &ConnectOptions, local_port: u16) -> Result<Child> {
+fn spawn_tunnel(
+    opts: &ConnectOptions,
+    local_port: u16,
+    events: &mpsc::Sender<TunnelEvent>,
+) -> Result<Child> {
     let args = build_ssh_args(&opts.target, local_port, opts.remote_port);
     let mut cmd = Command::new("ssh");
     cmd.args(&args)
         .stdin(Stdio::null())
-        // ssh chatter (banners, keepalive errors) belongs on stderr, never
-        // polluting --json stdout.
+        // ssh chatter (banners, keepalive errors) is captured and forwarded
+        // as SshLine events — never printed directly, so it can't pollute
+        // --json stdout or the --tui alternate screen.
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     // Terminal Ctrl-C reaches the child via the foreground process group,
     // but a `kill <supervisor>` from elsewhere would orphan the ssh child
     // and leak the tunnel. PR_SET_PDEATHSIG ties the child's lifetime to
@@ -263,15 +299,29 @@ fn spawn_tunnel(opts: &ConnectOptions, local_port: u16) -> Result<Child> {
             Ok(())
         });
     }
-    cmd.spawn().context("failed to spawn ssh (is OpenSSH installed?)")
+    let mut child = cmd.spawn().context("failed to spawn ssh (is OpenSSH installed?)")?;
+
+    // Forward ssh's stderr line-by-line; the thread ends at child exit (EOF).
+    if let Some(stderr) = child.stderr.take() {
+        let events = events.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else { break };
+                if events.send(TunnelEvent::SshLine(line)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    Ok(child)
 }
 
 /// Launch the remote server over ssh (`--start`), detached via nohup.
-fn start_remote_server(opts: &ConnectOptions) -> Result<()> {
-    eprintln!(
-        "connect: starting remote server ({} on {})...",
-        opts.remote_bin, opts.target.destination
-    );
+fn start_remote_server(opts: &ConnectOptions, events: &mpsc::Sender<TunnelEvent>) -> Result<()> {
+    let _ = events.send(TunnelEvent::StartingRemote {
+        bin: opts.remote_bin.clone(),
+        dest: opts.target.destination.clone(),
+    });
     let bind = format!("127.0.0.1:{}", opts.remote_port);
     let remote_cmd = format!(
         "nohup env ASTROBURST_BIND={bind} {} >/dev/null 2>&1 & sleep 0.5",
@@ -284,15 +334,18 @@ fn start_remote_server(opts: &ConnectOptions) -> Result<()> {
     }
     args.push(opts.target.destination.clone());
     args.push(remote_cmd);
-    let status = Command::new("ssh")
+    let output = Command::new("ssh")
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .context("failed to run remote start command")?;
-    if !status.success() {
-        bail!("remote start command exited with {status}");
+    for line in String::from_utf8_lossy(&output.stderr).lines() {
+        let _ = events.send(TunnelEvent::SshLine(line.to_string()));
+    }
+    if !output.status.success() {
+        bail!("remote start command exited with {}", output.status);
     }
     Ok(())
 }
@@ -320,7 +373,72 @@ pub fn run(args: &[String]) -> Result<()> {
         Some(p) => p,
         None => pick_free_port()?,
     };
+
+    if opts.tui {
+        return crate::tui::run_connect(opts, local_port);
+    }
+
+    // CLI mode: a printer thread renders supervisor events exactly as the
+    // pre-refactor code did — one machine-readable line on stdout under
+    // --json, everything else on stderr.
+    let (tx, rx) = mpsc::channel();
     let url = format!("http://127.0.0.1:{local_port}");
+    let json = opts.json;
+    let destination = opts.target.destination.clone();
+    let printer = std::thread::spawn(move || {
+        for event in rx {
+            match event {
+                TunnelEvent::Up { health, reestablished: false } => {
+                    if json {
+                        println!(
+                            "{{\"url\":\"{url}\",\"local_port\":{local_port},\"target\":\"{destination}\",\"health\":{health}}}"
+                        );
+                        use std::io::Write as _;
+                        let _ = std::io::stdout().flush();
+                    } else {
+                        eprintln!("connect: tunnel up -- server URL: {url}");
+                        eprintln!("connect: remote /health: {health}");
+                    }
+                }
+                TunnelEvent::Up { reestablished: true, .. } => {
+                    eprintln!("connect: tunnel re-established on {url}");
+                }
+                TunnelEvent::StartingRemote { bin, dest } => {
+                    eprintln!("connect: starting remote server ({bin} on {dest})...");
+                }
+                TunnelEvent::Retrying { backoff, reason, .. } => {
+                    eprintln!("connect: {reason}; reconnecting in {backoff:?}");
+                }
+                TunnelEvent::SshLine(line) => eprintln!("{line}"),
+                TunnelEvent::Fatal { .. } => {} // reported via supervise's Err
+            }
+        }
+    });
+
+    let result = supervise(&opts, local_port, &tx);
+    drop(tx);
+    let _ = printer.join();
+    result
+}
+
+/// The supervision loop: spawn the tunnel, await health, block on the ssh
+/// child, respawn with exponential backoff on the same local port. Status
+/// goes out as [`TunnelEvent`]s; the function only returns on a fatal
+/// condition (its `Err` mirrors the final `Fatal` event).
+pub fn supervise(
+    opts: &ConnectOptions,
+    local_port: u16,
+    events: &mpsc::Sender<TunnelEvent>,
+) -> Result<()> {
+    // A fatal condition is both an event (for the TUI pane) and an Err (for
+    // the CLI exit path).
+    macro_rules! fatal {
+        ($($arg:tt)*) => {{
+            let reason = format!($($arg)*);
+            let _ = events.send(TunnelEvent::Fatal { reason: reason.clone() });
+            bail!(reason);
+        }};
+    }
 
     let mut attempt: u32 = 0;
     let mut backoff = BACKOFF_INITIAL;
@@ -328,12 +446,16 @@ pub fn run(args: &[String]) -> Result<()> {
 
     loop {
         attempt += 1;
-        let mut child = spawn_tunnel(&opts, local_port)?;
+        let mut child = spawn_tunnel(opts, local_port, events)?;
 
         let mut health = await_health(local_port, Instant::now() + TUNNEL_READY_TIMEOUT);
 
         if matches!(health, ProbeResult::RemoteNotListening) && opts.start {
-            start_remote_server(&opts)?;
+            if let Err(e) = start_remote_server(opts, events) {
+                let _ = child.kill();
+                let _ = child.wait();
+                fatal!("{e}");
+            }
             health = await_health(local_port, Instant::now() + TUNNEL_READY_TIMEOUT);
         }
 
@@ -341,29 +463,16 @@ pub fn run(args: &[String]) -> Result<()> {
             ProbeResult::Healthy(body) => {
                 // Success resets the backoff schedule.
                 backoff = BACKOFF_INITIAL;
-                if !announced {
-                    announced = true;
-                    if opts.json {
-                        // Single machine-readable line on stdout; everything
-                        // else in this program goes to stderr.
-                        println!(
-                            "{{\"url\":\"{url}\",\"local_port\":{local_port},\"target\":\"{}\",\"health\":{body}}}",
-                            opts.target.destination
-                        );
-                        use std::io::Write as _;
-                        let _ = std::io::stdout().flush();
-                    } else {
-                        eprintln!("connect: tunnel up -- server URL: {url}");
-                        eprintln!("connect: remote /health: {body}");
-                    }
-                } else {
-                    eprintln!("connect: tunnel re-established on {url}");
-                }
+                let _ = events.send(TunnelEvent::Up {
+                    health: body.clone(),
+                    reestablished: announced,
+                });
+                announced = true;
             }
             ProbeResult::RemoteNotListening => {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!(
+                fatal!(
                     "tunnel to {} is up, but nothing answers on remote 127.0.0.1:{} \
                      (is astroburst-server running there? try --start)",
                     opts.target.destination,
@@ -374,16 +483,17 @@ pub fn run(args: &[String]) -> Result<()> {
                 let _ = child.kill();
                 let _ = child.wait();
                 if !opts.reconnect || opts.max_retries.is_some_and(|m| attempt > m) {
-                    bail!(
+                    fatal!(
                         "could not establish tunnel to {} within {TUNNEL_READY_TIMEOUT:?} \
                          (check `ssh {}` works non-interactively)",
                         opts.target.destination,
                         opts.target.destination
                     );
                 }
-                eprintln!(
-                    "connect: tunnel failed to come up (attempt {attempt}); retrying in {backoff:?}"
-                );
+                let _ = events.send(TunnelEvent::Retrying {
+                    backoff,
+                    reason: format!("tunnel failed to come up (attempt {attempt})"),
+                });
                 std::thread::sleep(backoff);
                 backoff = next_backoff(backoff);
                 continue;
@@ -394,12 +504,15 @@ pub fn run(args: &[String]) -> Result<()> {
         // keepalive timeout, remote reboot, ...).
         let status = child.wait().context("waiting on ssh child failed")?;
         if !opts.reconnect {
-            bail!("ssh tunnel exited ({status}); reconnect disabled");
+            fatal!("ssh tunnel exited ({status}); reconnect disabled");
         }
         if opts.max_retries.is_some_and(|m| attempt >= m) {
-            bail!("ssh tunnel exited ({status}); retry budget exhausted");
+            fatal!("ssh tunnel exited ({status}); retry budget exhausted");
         }
-        eprintln!("connect: tunnel dropped ({status}); reconnecting in {backoff:?}");
+        let _ = events.send(TunnelEvent::Retrying {
+            backoff,
+            reason: format!("tunnel dropped ({status})"),
+        });
         std::thread::sleep(backoff);
         backoff = next_backoff(backoff);
     }
@@ -480,6 +593,17 @@ mod tests {
     #[test]
     fn parse_args_requires_target() {
         assert!(parse_args(&["--json".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_tui_flag_and_json_conflict() {
+        let o = parse_args(&["host".to_string(), "--tui".to_string()]).unwrap();
+        assert!(o.tui);
+        assert!(!parse_args(&["host".to_string()]).unwrap().tui);
+        let err =
+            parse_args(&["host".to_string(), "--tui".to_string(), "--json".to_string()])
+                .unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
     }
 
     #[test]
