@@ -80,6 +80,9 @@ pub fn build_router(state: AppState) -> Router {
         // /v2/fs so agents can browse/stat server-side paths before `open`.
         .route("/v2/fs/list", routing::post(v2::fs::list))
         .route("/v2/fs/exists", routing::post(v2::fs::exists))
+        // Stateless raw byte transfer — streams a file verbatim, honors Range,
+        // and (taking no session/state) is outside the SESSION_MAX/JOBS_MAX caps.
+        .route("/v2/fs/raw", routing::get(v2::fs::raw_get).head(v2::fs::raw_head))
         // Record session-scoped requests into the session's activity ring
         // (issue #3). Layered before with_state consumes `state`.
         .layer(middleware::from_fn_with_state(

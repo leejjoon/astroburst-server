@@ -480,12 +480,13 @@ HDU, cutout, and bin each set the new ref active.
 
 ---
 
-### Filesystem discovery
+### Filesystem discovery & transfer
 
-Two read-only endpoints for finding server-side files before opening them. They
-are **session-independent** (discovery precedes session creation), so they mount
-at `/v2/fs/*` with no `:sid`. There is no path confinement — the same arbitrary
-paths `open` already accepts.
+Read-only endpoints for finding server-side files (`list`, `exists`) and pulling
+their exact bytes (`raw`). They are **session-independent** — discovery/transfer
+precede or stand apart from session creation — so they mount at `/v2/fs/*` with no
+`:sid`. There is no path confinement — the same arbitrary paths `open` already
+accepts.
 
 #### `POST /v2/fs/list`
 
@@ -518,9 +519,37 @@ Stat a single path. A missing path is `exists: false`, **not** an error.
 ```
 Symlinks are followed (matching `open`), so a dangling link reads as `exists: false`.
 
+#### `GET /v2/fs/raw?path=<abs path>`
+
+Stream a file's **exact bytes** back as `application/fits`. Unlike
+`export/compressed`, this is verbatim (no re-compression), **stateless** (no
+session — so it is *not* bounded by `SESSION_MAX`/`JOBS_MAX`, and many concurrent
+pulls are fine), and **streamed from disk** (constant server memory regardless of
+file size).
+
+**Query:** `path` *(string, required)* — file to serve.
+
+**Response `200`:** body = the file bytes. Headers: `Content-Type: application/fits`, `Accept-Ranges: bytes`, `Content-Length: <size>`.
+
+**Range requests.** The endpoint advertises `Accept-Ranges: bytes` and honors a single `Range:` header — `bytes=S-`, `bytes=S-E`, or suffix `bytes=-N` (last N bytes) — making transfers resumable/retryable over a flaky link:
+
+- Satisfiable range → `206 Partial Content` with `Content-Range: bytes S-E/TOTAL` and `Content-Length` = slice length.
+- Well-formed but unsatisfiable range (start ≥ EOF, empty file, `bytes=-0`) → `416 Range Not Satisfiable` with `Content-Range: bytes */TOTAL`.
+- Malformed, multi-range (comma), inverted (`E < S`), or non-`bytes` units are **ignored** (RFC 7233) and the full body is served with `200`.
+
+**`HEAD /v2/fs/raw?path=…`** returns the same headers (notably `Content-Length` and `Accept-Ranges`) with no body — a cheap size probe that never opens the file for streaming.
+
+**Errors:** `404 not_found` if the path doesn't exist; `400 not_a_directory` if it's a directory.
+
 ```bash
 curl -X POST http://localhost:8080/v2/fs/list \
   -H 'Content-Type: application/json' -d '{"path":"/data","glob":"*.fits"}'
+
+# Whole file, or a resumable byte range.
+curl -o m51.fits 'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits'
+curl -I         'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits'          # size only
+curl -H 'Range: bytes=0-1048575' \
+     -o m51.part 'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits'          # first 1 MiB → 206
 ```
 
 ---
