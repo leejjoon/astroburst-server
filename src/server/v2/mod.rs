@@ -9,6 +9,7 @@
 pub mod bin;
 pub mod cutout;
 pub mod export;
+pub mod fs;
 pub mod histogram;
 pub mod images;
 pub mod inspect;
