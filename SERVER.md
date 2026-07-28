@@ -36,27 +36,92 @@ Startup log:
 
 ```
 INFO  astroburst_server] AstroBurst Headless Server v0.5.3
-INFO  astroburst_server] Listening on 127.0.0.1:8080
+INFO  astroburst_server] Listening on 127.0.0.1:8097
 INFO  astroburst_server] Session TTL: 900s, Max sessions: 8
 INFO  astroburst_server] Per-session cache: 32 entries / 2048 MiB
 INFO  astroburst_server] Cleanup interval: 60s
 ```
 
+### Command-line interface
+
+The binary takes **no positional flags** — runtime configuration is entirely via the `ASTROBURST_*` environment variables below. `argv` is used only to select a mode:
+
+| Invocation | What it does |
+|---|---|
+| `astroburst-server` | Start the HTTP server |
+| `astroburst-server connect <target>` | Open and supervise an SSH tunnel to a remote server (see below) |
+| `astroburst-server tui [URL]` | Run the live terminal dashboard against a server (default `http://127.0.0.1:8097`) |
+| `astroburst-server --help` / `-h` | Print usage and exit |
+| `astroburst-server --version` / `-V` | Print the version and exit |
+
+Any unrecognised argument — a stray flag, or a positional such as a hostname meant for `connect` — prints usage to stderr and exits `2`. The server takes no positional args, so it starts only when invoked with **no** arguments; it never falls through and boots silently on a typo.
+
 ### Remote GPU workstation via SSH tunnel
 
-On the remote machine:
+The server binds loopback-only (`127.0.0.1:8097`) for security, so a remote instance isn't reachable directly. Two ways to reach it from your local machine:
+
+**Recommended — the `connect` subcommand** manages the tunnel for you: it execs your system `ssh` (so `~/.ssh/config` aliases, keys, ssh-agent and jump hosts all work), forwards a local port to the remote's loopback port, probes `/health`, prints a working local URL, and auto-reconnects with backoff if the link drops.
 
 ```bash
+# On your local machine (server already running on the remote's :8097):
+astroburst-server connect gpubox            # ~/.ssh/config alias or hostname
+astroburst-server connect ssh://user@host.example:2222   # :2222 is the SSH port
+```
+
+It prints the local URL to use:
+
+```
+connect: tunnel up -- server URL: http://127.0.0.1:<local-port>
+```
+
+Leave it running to hold the tunnel open. Key flags:
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--remote-port N` | Server's HTTP port on the remote host | `8097` |
+| `--local-port N` | Local port for the forward | auto-picks a free port |
+| `--start` | Launch the remote server over SSH if nothing is listening | off |
+| `--remote-bin PATH` | Binary that `--start` runs on the remote | `astroburst-server` (on `$PATH`) |
+| `--tui` | Run the live dashboard instead of the plain supervisor | off |
+| `--json` | Emit one machine-readable line (`{"url":…,"local_port":…,"health":…}`) for scripts | off |
+| `--no-reconnect` | Exit when the tunnel drops instead of respawning | reconnects |
+| `--max-retries N` | Cap reconnect attempts | unlimited |
+
+`--json` and `--tui` are mutually exclusive. `astroburst-server connect --help` prints the full list.
+
+#### Launching the remote server with `--start`
+
+`--start` only launches a server when the target port is **not** already serving — it probes `/health` first:
+
+- **A server is already running there** → `--start` is a no-op; `connect` uses the existing server. Passing `--start` defensively is safe and idempotent.
+- **Nothing is listening** → the server is launched over SSH as `astroburst-server` (or `--remote-bin PATH`), bound to `127.0.0.1:<remote-port>` via `ASTROBURST_BIND`, detached with `nohup`, and logging to `${TMPDIR:-/tmp}/astroburst-server-<port>.log` on the remote. So the launched server's bind port is guaranteed to match what the tunnel forwards to.
+
+The launch is **self-diagnosing** rather than silent-on-failure:
+
+- If the binary isn't resolvable it says so and hints at `--remote-bin` with an absolute path (a non-login SSH shell often omits `~/.cargo/bin`, `~/.local/bin`).
+- If the server dies on startup — e.g. the port is occupied by another process (`Error: Address in use (os error 98)`) — the tail of the remote log is echoed back to your terminal, followed by a fatal `--start failed to bring up astroburst-server …`. The occupying process is never touched.
+
+When nothing is listening and `--start` is absent, `connect` exits with a clear message telling you to pass `--start` (or `--remote-port N` if the server is on a different port), instead of ssh's raw per-channel `Connection refused` noise (which is now filtered).
+
+#### Version check
+
+Once the tunnel is healthy, `connect` compares the remote server's reported `version` (from `/health`) against its own. If the `major.minor` differ it prints a warning to stderr (patch differences are treated as compatible; pre-1.0 minor bumps can be breaking). It's advisory only — the tunnel stays up:
+
+```
+connect: WARNING remote astroburst-server version 0.3.0 is incompatible with this client 0.2.1 (major.minor differ); the tunnel works but the API may not — rebuild/redeploy to match.
+```
+
+**Manual alternative** — set up the forward yourself:
+
+```bash
+# On the remote machine:
 ./astroburst-server
+
+# On your local machine:
+ssh -L 8097:localhost:8097 user@remote-host
 ```
 
-On your local machine:
-
-```bash
-ssh -L 8080:localhost:8080 user@remote-host
-```
-
-All API calls go to `http://localhost:8080` from the local machine — the SSH tunnel forwards them securely.
+All API calls then go to `http://localhost:8097` from the local machine — the SSH tunnel forwards them securely.
 
 ---
 
@@ -66,7 +131,7 @@ All knobs are set via environment variables. Unset variables use the defaults sh
 
 | Variable | Default | Description |
 |---|---|---|
-| `ASTROBURST_BIND` | `127.0.0.1:8080` | TCP address to listen on |
+| `ASTROBURST_BIND` | `127.0.0.1:8097` | TCP address to listen on |
 | `ASTROBURST_SESSION_TTL` | `900` | Idle seconds before a session is evicted |
 | `ASTROBURST_SESSION_MAX` | `8` | Maximum concurrent sessions |
 | `ASTROBURST_JOBS_MAX` | `4` | Maximum concurrent CPU-bound jobs |

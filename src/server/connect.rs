@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-const DEFAULT_REMOTE_PORT: u16 = 8080;
+const DEFAULT_REMOTE_PORT: u16 = 8097;
 /// Detect a dead peer within ~45s (15s x 3) instead of leaving a zombie
 /// tunnel that only fails at the next client request.
 const SERVER_ALIVE_INTERVAL: u32 = 15;
@@ -76,8 +76,39 @@ pub enum TunnelEvent {
     Retrying { backoff: Duration, reason: String },
     /// A line of ssh's stderr (banners, auth errors, keepalive timeouts).
     SshLine(String),
+    /// The remote server answered `/health` but its version is not compatible
+    /// with this client's (`major.minor` differ). Advisory only — the tunnel
+    /// still works; the API may not.
+    VersionMismatch { local: String, remote: String },
     /// Supervision is over; `supervise` returns Err with the same reason.
     Fatal { reason: String },
+}
+
+/// Pull the `version` string out of a `/health` JSON body, if present.
+fn extract_health_version(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("version")?.as_str().map(str::to_owned)
+}
+
+/// Parse a `major.minor` pair from a semver-ish string (`"0.2.1"` -> `(0, 2)`).
+fn major_minor(v: &str) -> Option<(u64, u64)> {
+    let mut it = v.trim().split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Client/server are considered compatible when their `major.minor` agree.
+/// Patch differences are fine; a differing (or unparseable) minor/major is a
+/// warning. Pre-1.0 minor bumps can be breaking, so `major.minor` is the right
+/// boundary here rather than `major` alone.
+fn versions_compatible(local: &str, remote: &str) -> bool {
+    match (major_minor(local), major_minor(remote)) {
+        (Some(l), Some(r)) => l == r,
+        // If either side is unparseable, fall back to an exact-string compare
+        // so we don't warn spuriously but still flag a genuine difference.
+        _ => local.trim() == remote.trim(),
+    }
 }
 
 /// An SSH destination: either a bare word delegated entirely to OpenSSH
@@ -307,6 +338,14 @@ fn spawn_tunnel(
         std::thread::spawn(move || {
             for line in BufReader::new(stderr).lines() {
                 let Ok(line) = line else { break };
+                // Drop the per-channel "connection refused" spam: ssh emits one
+                // of these for every forwarded channel while the remote server
+                // isn't listening, so a single stuck run prints dozens. The
+                // condition is already diagnosed cleanly as `RemoteNotListening`
+                // (see supervise), so forwarding the raw lines is pure noise.
+                if is_channel_refused_noise(&line) {
+                    continue;
+                }
                 if events.send(TunnelEvent::SshLine(line)).is_err() {
                     break;
                 }
@@ -316,16 +355,56 @@ fn spawn_tunnel(
     Ok(child)
 }
 
+/// True for ssh's forwarded-channel refusal line, e.g.
+/// `channel 3: open failed: connect failed: Connection refused`. These mean
+/// "the remote end of the -L forward refused the connection" — i.e. the remote
+/// server isn't listening on `--remote-port`. We detect and report that state
+/// via the health probe, so the raw lines are redundant noise worth dropping.
+fn is_channel_refused_noise(line: &str) -> bool {
+    let l = line.trim_start();
+    l.starts_with("channel ")
+        && l.contains("open failed")
+        && l.contains("Connection refused")
+}
+
 /// Launch the remote server over ssh (`--start`), detached via nohup.
+///
+/// The remote command is written to be self-diagnosing so that a failed start
+/// produces an actionable message rather than a silent no-op followed by the
+/// `RemoteNotListening` flood:
+///   - it first checks the binary is resolvable (`command -v`, or an executable
+///     absolute path) and exits 127 with a hint if not — this catches the most
+///     common failure, a binary that isn't on the non-login SSH `$PATH`;
+///   - it redirects the server's own stdout/stderr to a per-port log file
+///     (not `/dev/null`) so bind failures, panics, etc. are preserved;
+///   - after a short wait it confirms the process is still alive; if it died,
+///     it echoes the tail of that log so the real reason travels back to us.
+/// Any line the remote script prints to stderr is forwarded as an `SshLine`.
 fn start_remote_server(opts: &ConnectOptions, events: &mpsc::Sender<TunnelEvent>) -> Result<()> {
     let _ = events.send(TunnelEvent::StartingRemote {
         bin: opts.remote_bin.clone(),
         dest: opts.target.destination.clone(),
     });
     let bind = format!("127.0.0.1:{}", opts.remote_port);
+    let qbin = shell_quote(&opts.remote_bin);
+    let port = opts.remote_port;
+    // A POSIX-sh remote script (see doc comment). `log` lands in $TMPDIR or /tmp.
     let remote_cmd = format!(
-        "nohup env ASTROBURST_BIND={bind} {} >/dev/null 2>&1 & sleep 0.5",
-        shell_quote(&opts.remote_bin)
+        r#"bin={qbin}; log="${{TMPDIR:-/tmp}}/astroburst-server-{port}.log"; \
+if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$bin" ]; then \
+  echo "astroburst-connect: remote binary '$bin' not found on PATH and is not an executable path" >&2; \
+  echo "astroburst-connect: pass --remote-bin with an absolute path (a non-login ssh shell often omits ~/.cargo/bin, ~/.local/bin)" >&2; \
+  exit 127; \
+fi; \
+nohup env ASTROBURST_BIND={bind} "$bin" >"$log" 2>&1 & \
+pid=$!; sleep 1; \
+if ! kill -0 "$pid" 2>/dev/null; then \
+  echo "astroburst-connect: remote server exited immediately (see $log on {dest}); last lines:" >&2; \
+  tail -n 20 "$log" >&2 2>/dev/null || true; \
+  exit 1; \
+fi; \
+echo "astroburst-connect: remote server started (pid $pid, logging to $log)" >&2"#,
+        dest = opts.target.destination,
     );
     let mut args: Vec<String> = vec!["-o".into(), "BatchMode=yes".into()];
     if let Some(p) = opts.target.ssh_port {
@@ -345,7 +424,12 @@ fn start_remote_server(opts: &ConnectOptions, events: &mpsc::Sender<TunnelEvent>
         let _ = events.send(TunnelEvent::SshLine(line.to_string()));
     }
     if !output.status.success() {
-        bail!("remote start command exited with {}", output.status);
+        // The forwarded stderr above already carries the specific reason
+        // (binary-not-found / crash-log tail); keep this terse.
+        bail!(
+            "--start failed to bring up astroburst-server on {} (see messages above)",
+            opts.target.destination
+        );
     }
     Ok(())
 }
@@ -410,6 +494,14 @@ pub fn run(args: &[String]) -> Result<()> {
                     eprintln!("connect: {reason}; reconnecting in {backoff:?}");
                 }
                 TunnelEvent::SshLine(line) => eprintln!("{line}"),
+                TunnelEvent::VersionMismatch { local, remote } => {
+                    // Always to stderr — keeps the --json stdout line clean.
+                    eprintln!(
+                        "connect: WARNING remote astroburst-server version {remote} is \
+                         incompatible with this client {local} (major.minor differ); the \
+                         tunnel works but the API may not — rebuild/redeploy to match."
+                    );
+                }
                 TunnelEvent::Fatal { .. } => {} // reported via supervise's Err
             }
         }
@@ -463,20 +555,50 @@ pub fn supervise(
             ProbeResult::Healthy(body) => {
                 // Success resets the backoff schedule.
                 backoff = BACKOFF_INITIAL;
+                let first_announce = !announced;
                 let _ = events.send(TunnelEvent::Up {
                     health: body.clone(),
                     reestablished: announced,
                 });
                 announced = true;
+                // Verify the remote build is compatible — only on the first
+                // announce, so reconnects to the same server don't re-warn.
+                if first_announce {
+                    let local = env!("CARGO_PKG_VERSION");
+                    if let Some(remote) = extract_health_version(body) {
+                        if !versions_compatible(local, &remote) {
+                            let _ = events.send(TunnelEvent::VersionMismatch {
+                                local: local.to_string(),
+                                remote,
+                            });
+                        }
+                    }
+                }
             }
             ProbeResult::RemoteNotListening => {
                 let _ = child.kill();
                 let _ = child.wait();
+                if opts.start {
+                    // --start ran but the port is still dead: the specific
+                    // reason was already forwarded by start_remote_server.
+                    fatal!(
+                        "the SSH tunnel to {dest} is up, but after --start nothing is \
+                         listening on the remote's 127.0.0.1:{port}. The remote server \
+                         failed to start or bind (see the astroburst-connect messages \
+                         above). Check it starts by hand:  \
+                         ssh {dest} 'ASTROBURST_BIND=127.0.0.1:{port} {bin}'",
+                        dest = opts.target.destination,
+                        port = opts.remote_port,
+                        bin = opts.remote_bin,
+                    );
+                }
                 fatal!(
-                    "tunnel to {} is up, but nothing answers on remote 127.0.0.1:{} \
-                     (is astroburst-server running there? try --start)",
-                    opts.target.destination,
-                    opts.remote_port
+                    "the SSH tunnel to {dest} is up, but nothing is listening on the \
+                     remote's 127.0.0.1:{port}. The astroburst-server is not running \
+                     there (or is on a different port). Start it with --start, or if it \
+                     is already running on another port pass --remote-port N.",
+                    dest = opts.target.destination,
+                    port = opts.remote_port,
                 );
             }
             ProbeResult::TunnelNotUp => {
@@ -521,6 +643,46 @@ pub fn supervise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_version_is_extracted() {
+        let body = r#"{"status":"ok","version":"0.2.1","sessions_active":0}"#;
+        assert_eq!(extract_health_version(body).as_deref(), Some("0.2.1"));
+        assert_eq!(extract_health_version("not json"), None);
+        assert_eq!(extract_health_version(r#"{"status":"ok"}"#), None);
+    }
+
+    #[test]
+    fn version_compatibility_uses_major_minor() {
+        // Patch differences are compatible.
+        assert!(versions_compatible("0.2.1", "0.2.9"));
+        assert!(versions_compatible("1.4.0", "1.4.7"));
+        // Minor / major differences are not.
+        assert!(!versions_compatible("0.2.1", "0.3.0"));
+        assert!(!versions_compatible("0.2.1", "1.2.1"));
+        // Unparseable falls back to exact-string compare.
+        assert!(versions_compatible("weird", "weird"));
+        assert!(!versions_compatible("0.2.1", "weird"));
+    }
+
+    #[test]
+    fn channel_refused_noise_is_detected() {
+        // ssh's real wording, with and without leading whitespace.
+        assert!(is_channel_refused_noise(
+            "channel 3: open failed: connect failed: Connection refused"
+        ));
+        assert!(is_channel_refused_noise(
+            "  channel 12: open failed: connect failed: Connection refused"
+        ));
+        // Genuinely useful lines must NOT be filtered.
+        assert!(!is_channel_refused_noise("Permission denied (publickey)."));
+        assert!(!is_channel_refused_noise(
+            "ssh: connect to host olaf1 port 22: Connection refused"
+        ));
+        assert!(!is_channel_refused_noise(
+            "astroburst-connect: remote binary 'astroburst-server' not found on PATH and is not an executable path"
+        ));
+    }
 
     #[test]
     fn parse_target_bare_alias() {

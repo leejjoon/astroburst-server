@@ -26,7 +26,7 @@ use crate::connect::{self, ConnectOptions, TunnelEvent};
 use app::{Action, App, Detail, Snapshot, TunnelState};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_URL: &str = "http://127.0.0.1:8080";
+const DEFAULT_URL: &str = "http://127.0.0.1:8097";
 
 /// Entry for the standalone `tui` subcommand.
 pub fn run_standalone(args: &[String]) -> Result<()> {

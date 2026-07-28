@@ -402,7 +402,7 @@ mod tests {
     }
 
     fn populated_app() -> App {
-        let mut app = App::new("http://127.0.0.1:8080".into(), None);
+        let mut app = App::new("http://127.0.0.1:8097".into(), None);
         app.apply(Snapshot {
             health: Some(super::super::app::Health {
                 version: "0.2.0".into(),
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn empty_server_renders_hint() {
-        let app = App::new("http://127.0.0.1:8080".into(), None);
+        let app = App::new("http://127.0.0.1:8097".into(), None);
         let screen = render(&app);
         assert!(screen.contains("no sessions"), "{screen}");
     }
