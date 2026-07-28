@@ -11,7 +11,7 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// `ASTROBURST_BIND` — TCP address to listen on.
-    /// Default: `127.0.0.1:8080` (loopback only; access via `ssh -L` tunnel).
+    /// Default: `127.0.0.1:8097` (loopback only; access via `ssh -L` tunnel).
     pub bind: SocketAddr,
 
     /// `ASTROBURST_SESSION_TTL` — idle seconds before a session is evicted.
@@ -46,7 +46,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1:8080".parse().expect("default bind is valid"),
+            bind: "127.0.0.1:8097".parse().expect("default bind is valid"),
             session_ttl: Duration::from_secs(900),
             session_max: 8,
             jobs_max: 4,

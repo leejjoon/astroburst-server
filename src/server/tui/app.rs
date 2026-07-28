@@ -253,6 +253,11 @@ impl App {
                 t.phase = TunnelPhase::Reconnecting { backoff };
             }
             TunnelEvent::SshLine(line) => t.push_log(format!("ssh: {line}")),
+            TunnelEvent::VersionMismatch { local, remote } => {
+                t.push_log(format!(
+                    "WARNING version mismatch: remote {remote} vs client {local}"
+                ));
+            }
             TunnelEvent::Fatal { reason } => {
                 t.push_log(format!("FATAL: {reason}"));
                 t.phase = TunnelPhase::Fatal(reason);

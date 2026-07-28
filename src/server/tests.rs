@@ -251,7 +251,7 @@ fn config_env_var_parsed_and_invalid_falls_back() {
     assert_eq!(d.session_ttl.as_secs(), 900);
     assert_eq!(d.cleanup_interval.as_secs(), 60);
     assert_eq!(d.log_level, "info");
-    assert_eq!(d.bind.to_string(), "127.0.0.1:8080");
+    assert_eq!(d.bind.to_string(), "127.0.0.1:8097");
 }
 
 // ── v2 API: sessions & image lifecycle (issue #2) ────────────────────────────

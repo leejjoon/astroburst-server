@@ -37,7 +37,7 @@ cargo build --release \
 ./target/release/astroburst-server
 ```
 
-Binds to `127.0.0.1:8080` by default — see `SERVER.md` for configuration (env vars), the full API reference, and
+Binds to `127.0.0.1:8097` by default — see `SERVER.md` for configuration (env vars), the full API reference, and
 the session/job model. `SERVER_TESTING.md` has a curl-driven walkthrough of every endpoint.
 
 ## Python client
