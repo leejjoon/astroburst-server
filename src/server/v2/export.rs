@@ -14,7 +14,9 @@ use axum::{
 };
 use serde::Deserialize;
 
-use astroburst_lib::infra::fits::mef_writer::write_compressed_mef;
+use astroburst_lib::infra::fits::mef_writer::{
+    write_compressed_mef, CompressMode, CompressOptions,
+};
 
 use crate::error::{AppError, Result};
 use crate::extractors::SessionExtractor;
@@ -31,8 +33,13 @@ pub struct ExportCompressedParams {
     pub image_ref: Option<String>,
     /// Noise-relative quantization level applied to every float extension
     /// (smaller = more aggressive/lossy, smaller file). Defaults to 16.0.
+    /// Ignored when `lossless` is true.
     #[serde(default)]
     pub quantize_level: Option<f64>,
+    /// When true, compress float extensions **losslessly** (GZIP_2 byte-shuffle
+    /// + gzip, bit-exact) instead of the lossy quantized RICE_1 default.
+    #[serde(default)]
+    pub lossless: bool,
 }
 
 /// Resolve the ref an operation targets: the explicit `ref` if given, else the
@@ -79,12 +86,19 @@ pub async fn export_compressed(
         ))
     })?;
     drop(meta);
-    let quantize_level = params.quantize_level.unwrap_or(DEFAULT_QUANTIZE_LEVEL);
+    let mode = if params.lossless {
+        CompressMode::Lossless
+    } else {
+        CompressMode::Lossy {
+            quantize_level: params.quantize_level.unwrap_or(DEFAULT_QUANTIZE_LEVEL),
+        }
+    };
+    let opts = CompressOptions { mode, drop_extnames: vec![], raw_extnames: vec![] };
 
     let bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
         let tmp = tempfile::Builder::new().suffix(".fits").tempfile()?;
         let tmp_path = tmp.path().to_string_lossy().to_string();
-        write_compressed_mef(&source_path, &tmp_path, quantize_level)?;
+        write_compressed_mef(&source_path, &tmp_path, &opts)?;
         let bytes = std::fs::read(&tmp_path)?;
         // `tmp` (NamedTempFile) is removed on drop here.
         Ok(bytes)

@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
+use crate::infra::fits::compress::gzip::gzip2_encode;
 use crate::infra::fits::compress::quantize::{quantize_tile, QuantizeResult, NULL_VALUE};
 use crate::infra::fits::compress::rice::RiceParams;
 use crate::infra::fits::compress::rice_encode::rice_encode;
@@ -590,6 +591,11 @@ fn write_compressed_bintable(
     bzero: f64,
     bscale: f64,
     header: Option<&HduHeader>,
+    // Tile-compression algorithm name written to ZCMPTYPE: "RICE_1" for the
+    // quantized-float and lossless-integer paths, "GZIP_2" for lossless float.
+    // The RICE-specific ZNAMEn/ZVALn (BLOCKSIZE/BYTEPIX) cards are emitted only
+    // for RICE_1; the GZIP decoder derives everything it needs from ZBITPIX.
+    zcmptype: &str,
     rows: &[EncodedRow],
 ) -> Result<()> {
     let tfields: usize = if quantized { 4 } else { 1 };
@@ -629,7 +635,7 @@ fn write_compressed_bintable(
     }
 
     push_header_card(&mut buf, "ZIMAGE", "T");
-    push_header_card(&mut buf, "ZCMPTYPE", "RICE_1");
+    push_header_card(&mut buf, "ZCMPTYPE", zcmptype);
     push_header_card(&mut buf, "ZBITPIX", &zbitpix.to_string());
     push_header_card(&mut buf, "ZNAXIS", if nplanes > 1 { "3" } else { "2" });
     push_header_card(&mut buf, "ZNAXIS1", &ncols.to_string());
@@ -642,11 +648,15 @@ fn write_compressed_bintable(
     if nplanes > 1 {
         push_header_card(&mut buf, "ZTILE3", "1");
     }
-    push_header_card(&mut buf, "ZNAME1", "BLOCKSIZE");
-    push_header_card(&mut buf, "ZVAL1", &RICE_BLOCKSIZE.to_string());
-    push_header_card(&mut buf, "ZNAME2", "BYTEPIX");
-    let bytepix_str = match zbitpix { 8 => "1", 16 => "2", _ => "4" };
-    push_header_card(&mut buf, "ZVAL2", bytepix_str);
+    if zcmptype == "RICE_1" {
+        // RICE_1 tile parameters. GZIP_2 has none — the decoder infers the
+        // byte width from ZBITPIX (see compress/tiles.rs), so no ZNAMEn/ZVALn.
+        push_header_card(&mut buf, "ZNAME1", "BLOCKSIZE");
+        push_header_card(&mut buf, "ZVAL1", &RICE_BLOCKSIZE.to_string());
+        push_header_card(&mut buf, "ZNAME2", "BYTEPIX");
+        let bytepix = (zbitpix.unsigned_abs() / 8).max(1);
+        push_header_card(&mut buf, "ZVAL2", &bytepix.to_string());
+    }
     if quantized {
         push_header_card(&mut buf, "ZQUANTIZ", "SUBTRACTIVE_DITHER_1");
         push_header_card(&mut buf, "ZDITHER0", &RICE_DITHER_SEED.to_string());
@@ -754,7 +764,7 @@ pub fn write_fits_mono_rice(
     write_primary_hdu_stub(&mut writer, None)?;
     write_compressed_bintable(
         &mut writer, ncols, nrows, 1, bitpix, quantized, has_null, Some(I16_BLANK as i64),
-        bzero, bscale, header, &encoded_rows,
+        bzero, bscale, header, "RICE_1", &encoded_rows,
     )?;
     writer.flush()?;
     Ok(())
@@ -821,7 +831,7 @@ pub fn write_fits_rgb_rice(
     write_primary_hdu_stub(&mut writer, None)?;
     write_compressed_bintable(
         &mut writer, ncols, nrows, 3, bitpix, quantized, has_null, Some(I16_BLANK as i64),
-        bzero, bscale, header, &encoded_rows,
+        bzero, bscale, header, "RICE_1", &encoded_rows,
     )?;
     writer.flush()?;
     Ok(())
@@ -878,7 +888,7 @@ pub(crate) fn write_planes_quantized(
 
     write_compressed_bintable(
         writer, ncols, nrows, planes.len(), -32, true, has_null, None, 0.0, 1.0, header,
-        &encoded_rows,
+        "RICE_1", &encoded_rows,
     )
 }
 
@@ -934,7 +944,70 @@ pub(crate) fn write_planes_lossless_int(
 
     write_compressed_bintable(
         writer, ncols, nrows, raw_planes.len(), zbitpix, false, false, blank, bzero, bscale,
-        header, &encoded_rows,
+        header, "RICE_1", &encoded_rows,
+    )
+}
+
+/// Write N planes of float pixel data as a **losslessly** GZIP_2 tile-compressed
+/// BINTABLE extension. `raw_plane_bytes` holds each plane's RAW big-endian
+/// stored bytes verbatim (`ncols*nrows*bytepix` each, straight from the source
+/// mmap — NOT decoded/rescaled), so the round-trip is byte-exact regardless of
+/// the source's BZERO/BSCALE, which are carried through unchanged. `zbitpix` is
+/// -32 or -64 (bytepix 4 or 8). One tile per image row (ZTILE1=ncols, ZTILE2=1),
+/// matching the quantized layout; each row is byte-shuffled then gzipped
+/// (`gzip2_encode`). There is no quantization, so no ZQUANTIZ/ZSCALE/ZZERO —
+/// the single COMPRESSED_DATA column (the non-quantized layout) is used.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_planes_gzip2_lossless(
+    writer: &mut BufWriter<File>,
+    raw_plane_bytes: &[&[u8]],
+    ncols: usize,
+    nrows: usize,
+    zbitpix: i32,
+    bzero: f64,
+    bscale: f64,
+    header: Option<&HduHeader>,
+) -> Result<()> {
+    let bytepix = match zbitpix {
+        -32 => 4usize,
+        -64 => 8usize,
+        other => bail!("write_planes_gzip2_lossless: unsupported ZBITPIX {other} (need -32/-64)"),
+    };
+    let row_bytes = ncols * bytepix;
+    let plane_bytes = row_bytes * nrows;
+
+    // Validate plane byte lengths up front (sequentially) so the parallel
+    // encode below stays `?`-free.
+    for plane in raw_plane_bytes {
+        if plane.len() != plane_bytes {
+            bail!(
+                "plane byte length {} does not match {ncols}x{nrows}x{bytepix}",
+                plane.len()
+            );
+        }
+    }
+
+    // Rows are independent GZIP_2 tiles; encode them in parallel. A flat
+    // plane-major index range preserves the original row order (rayon's
+    // IndexedParallelIterator collects in index order).
+    let encoded_rows: Vec<EncodedRow> = (0..raw_plane_bytes.len() * nrows)
+        .into_par_iter()
+        .map(|idx| {
+            let plane = raw_plane_bytes[idx / nrows];
+            let row_i = idx % nrows;
+            let row = &plane[row_i * row_bytes..(row_i + 1) * row_bytes];
+            EncodedRow {
+                compressed: gzip2_encode(row, bytepix),
+                gzip: Vec::new(),
+                zscale: 0.0,
+                zzero: 0.0,
+            }
+        })
+        .collect();
+
+    write_compressed_bintable(
+        writer, ncols, nrows, raw_plane_bytes.len(), zbitpix, false, false, None, bzero, bscale,
+        header, "GZIP_2", &encoded_rows,
     )
 }
 

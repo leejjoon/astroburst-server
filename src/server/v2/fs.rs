@@ -19,10 +19,13 @@
 
 use std::path::Path;
 
+use astroburst_lib::infra::fits::mef_writer::{
+    write_compressed_mef, CompressMode, CompressOptions, MefReport,
+};
 use axum::{
     body::Body,
     extract::Query,
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
     Json,
 };
@@ -56,8 +59,22 @@ pub struct ExistsParams {
 
 #[derive(Deserialize)]
 pub struct RawParams {
-    /// Absolute path of the file to serve verbatim.
+    /// Absolute path of the file to serve.
     pub path: String,
+    /// Optional transform. Absent / `none` → verbatim bytes (Range-native).
+    /// `lossless` → a per-HDU GZIP_2 lossless-compressed FITS (bit-exact,
+    /// ~1.8× smaller), generated on the fly.
+    #[serde(default)]
+    pub compress: Option<String>,
+    /// Optional comma-separated EXTNAMEs to omit from the output (e.g.
+    /// `PSF,WCS-WAVE`). Requires `compress=lossless` (it rewrites structure).
+    #[serde(default)]
+    pub drop: Option<String>,
+    /// Optional comma-separated EXTNAMEs to pass through **uncompressed** (a
+    /// blocklist): everything else is compressed, these stay verbatim but
+    /// present. Requires `compress=lossless`.
+    #[serde(default)]
+    pub raw: Option<String>,
 }
 
 /// POST /v2/fs/list — non-recursive directory listing.
@@ -89,11 +106,70 @@ pub async fn exists(Json(params): Json<ExistsParams>) -> Result<Json<Value>> {
 /// flaky link are resumable/retryable. Missing path → 404, directory → 400,
 /// unsatisfiable range → 416.
 pub async fn raw_get(headers: HeaderMap, Query(params): Query<RawParams>) -> Result<Response> {
-    let meta = stat_regular_file(&params.path).await?;
-    let total = meta.len();
+    let compress = parse_compress_request(&params)?; // 400 before touching the fs
+    let meta = stat_regular_file(&params.path).await?; // 404 missing / 400 dir
+    let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).map(str::to_owned);
 
-    // Resolve the byte window to serve.
-    let (status, start, len) = match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+    match compress {
+        // Verbatim: stream the file itself.
+        None => {
+            let file = tokio::fs::File::open(&params.path).await.map_err(|e| {
+                // Raced with a delete/rename between stat and open.
+                AppError::NotFound(format!("cannot open {}: {e}", params.path))
+            })?;
+            build_stream_response(file, meta.len(), range.as_deref()).await
+        }
+        // Compressed: materialize to a temp file, then stream from its (now
+        // unlinked) fd — same Range logic, bounded RAM.
+        Some(req) => {
+            let (file, total, report) = compress_to_temp(&params.path, req).await?;
+            let mut resp = build_stream_response(file, total, range.as_deref()).await?;
+            set_hdu_headers(&mut resp, &report);
+            Ok(resp)
+        }
+    }
+}
+
+/// HEAD /v2/fs/raw?path=… — size/headers only, no body. For a verbatim request
+/// this only stats the file. With `compress=lossless` it performs the
+/// compression to report an accurate `Content-Length` (same cost as a GET —
+/// bulk clients should just GET). Registered as its own handler so axum's
+/// automatic-HEAD doesn't run the streaming GET handler just to discard the
+/// body (which would also leave `Content-Length` unset for a stream).
+pub async fn raw_head(Query(params): Query<RawParams>) -> Result<Response> {
+    let compress = parse_compress_request(&params)?;
+    let meta = stat_regular_file(&params.path).await?;
+
+    let (total, report) = match compress {
+        None => (meta.len(), None),
+        Some(req) => {
+            let (file, total, report) = compress_to_temp(&params.path, req).await?;
+            drop(file); // HEAD has no body; release the unlinked temp fd now
+            (total, Some(report))
+        }
+    };
+
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/fits")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, total)
+        .body(Body::empty())
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("build response: {e}")))?;
+    if let Some(report) = report {
+        set_hdu_headers(&mut resp, &report);
+    }
+    Ok(resp)
+}
+
+/// Build a `200`/`206` streaming response from an already-open file, honoring an
+/// optional `Range:` header (shared by the verbatim and compressed paths).
+async fn build_stream_response(
+    mut file: tokio::fs::File,
+    total: u64,
+    range: Option<&str>,
+) -> Result<Response> {
+    let (status, start, len) = match range {
         Some(spec) => match parse_range(spec, total) {
             RangeOutcome::Satisfiable(s, l) => (StatusCode::PARTIAL_CONTENT, s, l),
             RangeOutcome::Unsatisfiable => return unsatisfiable(total),
@@ -103,14 +179,10 @@ pub async fn raw_get(headers: HeaderMap, Query(params): Query<RawParams>) -> Res
         None => (StatusCode::OK, 0u64, total),
     };
 
-    let mut file = tokio::fs::File::open(&params.path).await.map_err(|e| {
-        // Raced with a delete/rename between stat and open.
-        AppError::NotFound(format!("cannot open {}: {e}", params.path))
-    })?;
     if start > 0 {
         file.seek(std::io::SeekFrom::Start(start))
             .await
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("seek {}: {e}", params.path)))?;
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("seek: {e}")))?;
     }
     let body = Body::from_stream(ReaderStream::new(file.take(len)));
 
@@ -129,19 +201,105 @@ pub async fn raw_get(headers: HeaderMap, Query(params): Query<RawParams>) -> Res
         .map_err(|e| AppError::Internal(anyhow::anyhow!("build response: {e}")))
 }
 
-/// HEAD /v2/fs/raw?path=… — size/headers only, no body. Stats the file rather
-/// than opening a stream, so it stays cheap. Registered as its own handler so
-/// axum's automatic-HEAD doesn't run the streaming GET handler just to discard
-/// the body (which would also leave `Content-Length` unset for a stream).
-pub async fn raw_head(Query(params): Query<RawParams>) -> Result<Response> {
-    let meta = stat_regular_file(&params.path).await?;
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/fits")
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_LENGTH, meta.len())
-        .body(Body::empty())
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("build response: {e}")))
+/// Compress `source_path` to a temp file (lossless GZIP_2, with any dropped
+/// HDUs), reopen it, then unlink it so the returned fd is the only reference —
+/// on Linux the inode's blocks persist until the stream drops, giving bounded
+/// RAM and automatic cleanup. Returns `(open temp fd, byte length, dropped
+/// EXTNAMEs)`.
+async fn compress_to_temp(
+    source_path: &str,
+    req: CompressRequest,
+) -> Result<(tokio::fs::File, u64, MefReport)> {
+    let source = source_path.to_owned();
+    let (tmp, report) = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(tempfile::NamedTempFile, MefReport)> {
+            let tmp = tempfile::Builder::new().suffix(".fits").tempfile()?;
+            let tmp_path = tmp.path().to_string_lossy().to_string();
+            let opts = CompressOptions {
+                mode: CompressMode::Lossless,
+                drop_extnames: req.drop_extnames,
+                raw_extnames: req.raw_extnames,
+            };
+            let report = write_compressed_mef(&source, &tmp_path, &opts)?;
+            Ok((tmp, report))
+        },
+    )
+    .await
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("task panic: {e}")))?
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("compress {source_path}: {e:#}")))?;
+
+    let file = tokio::fs::File::open(tmp.path())
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("reopen temp: {e}")))?;
+    let total = file
+        .metadata()
+        .await
+        .map(|m| m.len())
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("stat temp: {e}")))?;
+    drop(tmp); // unlink; the open `file` fd keeps the inode alive
+    Ok((file, total, report))
+}
+
+/// Echo the actually-dropped / kept-raw EXTNAMEs in `x-dropped-hdus` /
+/// `x-raw-hdus` (comma-separated), when non-empty.
+fn set_hdu_headers(resp: &mut Response, report: &MefReport) {
+    for (name, list) in [("x-dropped-hdus", &report.dropped), ("x-raw-hdus", &report.kept_raw)] {
+        if list.is_empty() {
+            continue;
+        }
+        if let Ok(v) = HeaderValue::from_str(&list.join(",")) {
+            resp.headers_mut().insert(name, v);
+        }
+    }
+}
+
+/// A validated `compress=lossless` request.
+struct CompressRequest {
+    /// EXTNAMEs to omit entirely.
+    drop_extnames: Vec<String>,
+    /// EXTNAMEs to pass through uncompressed.
+    raw_extnames: Vec<String>,
+}
+
+/// Split a comma-separated EXTNAME list, trimming and dropping empties.
+fn split_extnames(v: Option<&str>) -> Vec<String> {
+    v.unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Parse/validate the `compress`, `drop`, and `raw` query params. `Ok(None)` =
+/// serve verbatim; `Ok(Some(..))` = lossless compression. Unknown `compress`, or
+/// `drop`/`raw` without `compress`, → `400`.
+fn parse_compress_request(params: &RawParams) -> Result<Option<CompressRequest>> {
+    let drop_extnames = split_extnames(params.drop.as_deref());
+    let raw_extnames = split_extnames(params.raw.as_deref());
+
+    match params.compress.as_deref() {
+        None | Some("") | Some("none") => {
+            if !drop_extnames.is_empty() || !raw_extnames.is_empty() {
+                return Err(AppError::BadRequestWithHint {
+                    code: "bad_request",
+                    message: "`drop`/`raw` require `compress=lossless`".into(),
+                    hint: Some(
+                        "selecting HDUs to drop or keep-raw rewrites the file, which only the \
+                         compressed path does"
+                            .into(),
+                    ),
+                });
+            }
+            Ok(None)
+        }
+        Some("lossless") => Ok(Some(CompressRequest { drop_extnames, raw_extnames })),
+        Some(other) => Err(AppError::BadRequestWithHint {
+            code: "bad_request",
+            message: format!("unknown compress mode {other:?}"),
+            hint: Some("supported: compress=lossless (or omit for verbatim bytes)".into()),
+        }),
+    }
 }
 
 /// `416 Range Not Satisfiable` with the required `Content-Range: bytes */TOTAL`.
@@ -488,6 +646,47 @@ mod tests {
             RangeOutcome::Unsatisfiable => "Unsatisfiable",
             RangeOutcome::Ignore => "Ignore",
         }
+    }
+
+    fn params(compress: Option<&str>, drop: Option<&str>, raw: Option<&str>) -> RawParams {
+        RawParams {
+            path: "/x.fits".into(),
+            compress: compress.map(str::to_owned),
+            drop: drop.map(str::to_owned),
+            raw: raw.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn parse_compress_request_cases() {
+        // Verbatim: absent / empty / explicit none, no drop/raw.
+        assert!(parse_compress_request(&params(None, None, None)).unwrap().is_none());
+        assert!(parse_compress_request(&params(Some(""), None, None)).unwrap().is_none());
+        assert!(parse_compress_request(&params(Some("none"), None, None)).unwrap().is_none());
+
+        // Lossless, no filters.
+        let r = parse_compress_request(&params(Some("lossless"), None, None)).unwrap().unwrap();
+        assert!(r.drop_extnames.is_empty() && r.raw_extnames.is_empty());
+
+        // Lossless + drop list: split, trimmed, empties removed.
+        let r = parse_compress_request(&params(Some("lossless"), Some("PSF, WCS-WAVE ,,"), None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.drop_extnames, vec!["PSF".to_string(), "WCS-WAVE".to_string()]);
+
+        // Lossless + raw (blocklist) list.
+        let r = parse_compress_request(&params(Some("lossless"), None, Some(" PSF ,, ZODI")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.raw_extnames, vec!["PSF".to_string(), "ZODI".to_string()]);
+
+        // drop/raw without compress → error.
+        assert!(parse_compress_request(&params(None, Some("PSF"), None)).is_err());
+        assert!(parse_compress_request(&params(Some("none"), None, Some("PSF"))).is_err());
+
+        // Unknown compress mode → error.
+        assert!(parse_compress_request(&params(Some("gzip"), None, None)).is_err());
+        assert!(parse_compress_request(&params(Some("lossy"), None, None)).is_err());
     }
 
     #[test]

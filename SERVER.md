@@ -527,29 +527,40 @@ session — so it is *not* bounded by `SESSION_MAX`/`JOBS_MAX`, and many concurr
 pulls are fine), and **streamed from disk** (constant server memory regardless of
 file size).
 
-**Query:** `path` *(string, required)* — file to serve.
+**Query:**
+- `path` *(string, required)* — file to serve.
+- `compress` *(string, optional)* — `lossless` transforms the response into a per-HDU **lossless** compressed FITS (see below); absent / `none` serves the verbatim bytes.
+- `drop` *(string, optional)* — comma-separated EXTNAMEs to omit from the output, e.g. `PSF,WCS-WAVE` (case-insensitive). **Requires** `compress=lossless`.
+- `raw` *(string, optional)* — comma-separated EXTNAMEs to pass through **uncompressed** (a blocklist): everything else is compressed, these stay verbatim but present, e.g. `raw=PSF`. **Requires** `compress=lossless`. `drop` wins if a name is in both.
 
 **Response `200`:** body = the file bytes. Headers: `Content-Type: application/fits`, `Accept-Ranges: bytes`, `Content-Length: <size>`.
 
-**Range requests.** The endpoint advertises `Accept-Ranges: bytes` and honors a single `Range:` header — `bytes=S-`, `bytes=S-E`, or suffix `bytes=-N` (last N bytes) — making transfers resumable/retryable over a flaky link:
+**Lossless compression (`compress=lossless`).** Returns a FITS where float image HDUs are **GZIP_2** tile-compressed (byte-shuffle + gzip) and integer HDUs are RICE_1 — both bit-exact — while non-image/already-compressed HDUs pass through verbatim. Typically ~1.8× smaller than the raw file with **zero** pixel loss; astropy reads the result transparently (`CompImageHDU`). The file is generated on the fly and streamed from a temp fd (bounded server memory); the endpoint stays stateless, so it is still outside `SESSION_MAX`/`JOBS_MAX`. `drop=…` additionally omits named HDUs and `raw=…` leaves named HDUs uncompressed but present (both rewrite the file, so they only apply here); the EXTNAMEs actually dropped / kept-raw are echoed in **`x-dropped-hdus`** / **`x-raw-hdus`** response headers. Compression is CPU-bound (runs on the blocking pool); each request regenerates deterministically (so a cross-request `Range` resume is byte-consistent).
+
+**Range requests.** The endpoint advertises `Accept-Ranges: bytes` and honors a single `Range:` header — `bytes=S-`, `bytes=S-E`, or suffix `bytes=-N` (last N bytes) — making transfers resumable/retryable over a flaky link (verbatim *and* compressed):
 
 - Satisfiable range → `206 Partial Content` with `Content-Range: bytes S-E/TOTAL` and `Content-Length` = slice length.
 - Well-formed but unsatisfiable range (start ≥ EOF, empty file, `bytes=-0`) → `416 Range Not Satisfiable` with `Content-Range: bytes */TOTAL`.
 - Malformed, multi-range (comma), inverted (`E < S`), or non-`bytes` units are **ignored** (RFC 7233) and the full body is served with `200`.
 
-**`HEAD /v2/fs/raw?path=…`** returns the same headers (notably `Content-Length` and `Accept-Ranges`) with no body — a cheap size probe that never opens the file for streaming.
+**`HEAD /v2/fs/raw?path=…`** returns the same headers (notably `Content-Length` and `Accept-Ranges`) with no body — a cheap size probe. With `compress=lossless` it performs the compression to report an accurate `Content-Length` (same cost as a GET; bulk clients should just GET).
 
-**Errors:** `404 not_found` if the path doesn't exist; `400 not_a_directory` if it's a directory.
+**Errors:** `404 not_found` if the path doesn't exist; `400 not_a_directory` if it's a directory; `400 bad_request` for an unknown `compress` value or `drop`/`raw` without `compress`.
 
 ```bash
 curl -X POST http://localhost:8080/v2/fs/list \
   -H 'Content-Type: application/json' -d '{"path":"/data","glob":"*.fits"}'
 
-# Whole file, or a resumable byte range.
+# Verbatim whole file, or a resumable byte range.
 curl -o m51.fits 'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits'
 curl -I         'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits'          # size only
 curl -H 'Range: bytes=0-1048575' \
      -o m51.part 'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits'          # first 1 MiB → 206
+
+# Lossless-compressed pull (~1.8× smaller, bit-exact), optionally selecting HDUs.
+curl -o m51.fits 'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits&compress=lossless'
+curl -o m51.fits 'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits&compress=lossless&drop=PSF,WCS-WAVE'
+curl -o m51.fits 'http://localhost:8080/v2/fs/raw?path=/data/m51_ha.fits&compress=lossless&raw=PSF'   # PSF left uncompressed
 ```
 
 ---
@@ -863,19 +874,30 @@ Unknown `algorithm`/`stretch`/`colormap` → `400 bad_request` (with a hint list
 
 #### `POST /v2/sessions/:sid/export/compressed`
 
-Download a RICE_1-compressed copy of a ref's **source** MEF. Returns
+Download a compressed copy of a ref's **source** MEF. Returns
 `application/fits` as an attachment (`filename="<ref>_compressed.fits"`).
 
-**Body:** `ref` *(alias `image`/`image_ref`, optional — defaults to active ref)*; `quantize_level` *(f64, default `16.0`)* — noise-relative float quantization; smaller = more aggressive/lossy = smaller file.
+**Body:** `ref` *(alias `image`/`image_ref`, optional — defaults to active ref)*; `quantize_level` *(f64, default `16.0`)* — noise-relative float quantization; smaller = more aggressive/lossy = smaller file; `lossless` *(bool, default `false`)* — when true, compress float extensions **losslessly** (GZIP_2, bit-exact) instead of the lossy quantized RICE_1 default, ignoring `quantize_level`.
 
 **Requires a ref with a source file on disk** — derived refs (cutout/bin) have
 none and return `400 bad_request`. `404` if the ref isn't in the session.
 
+For bulk/stateless lossless pulls, prefer `GET /v2/fs/raw?path=…&compress=lossless`
+(same GZIP_2 output, no session, resumable) — this endpoint is the session-scoped
+equivalent.
+
 ```bash
+# Lossy (default) — smaller, quantized floats.
 curl -X POST http://localhost:8080/v2/sessions/$SID/export/compressed \
   -H 'Content-Type: application/json' \
   -d '{"ref":"img_0","quantize_level":16.0}' \
   -o img_0_compressed.fits
+
+# Lossless — bit-exact GZIP_2 floats.
+curl -X POST http://localhost:8080/v2/sessions/$SID/export/compressed \
+  -H 'Content-Type: application/json' \
+  -d '{"ref":"img_0","lossless":true}' \
+  -o img_0_lossless.fits
 ```
 
 The RICE_1 row encoding is parallelised across cores; bound it with
