@@ -40,6 +40,31 @@ cargo build --release \
 Binds to `127.0.0.1:8097` by default — see `SERVER.md` for configuration (env vars), the full API reference, and
 the session/job model. `SERVER_TESTING.md` has a curl-driven walkthrough of every endpoint.
 
+### Portable static build (musl)
+
+A plain `cargo build --release` produces a **glibc dynamic** binary that links `libbz2.so.1.0` (pulled in
+through the FITS compression stack) and won't run on a machine missing that shared library — the symptom is
+`error while loading shared libraries: libbz2.so.1.0`. To get a fully static, copy-anywhere binary, build for
+the musl target — this is the exact recipe the release workflow uses, and it compiles bzip2 from source into
+the binary so there's no runtime dependency:
+
+```bash
+rustup target add x86_64-unknown-linux-musl   # once
+sudo apt-get install -y musl-tools            # once — provides musl-gcc for the C bits (bzip2, ring)
+
+CC_x86_64_unknown_linux_musl=musl-gcc \
+cargo build --release \
+  --target x86_64-unknown-linux-musl \
+  --no-default-features \
+  --features server,astrometry-net,asdf-full,vizier \
+  --bin astroburst-server
+
+ldd target/x86_64-unknown-linux-musl/release/astroburst-server   # expect: "statically linked"
+```
+
+The binary lands at `target/x86_64-unknown-linux-musl/release/astroburst-server`; copy that one file to any
+x86-64 machine and it runs with nothing else installed.
+
 ## Python client
 
 `agent/astroburst_client/` is an async Python SDK for the server (session/job wrappers, SSE streaming). See
