@@ -46,6 +46,23 @@ the session/job model. `SERVER_TESTING.md` has a curl-driven walkthrough of ever
 `agent/README.md` and `agent/examples/` — including `v2_api_demo.ipynb`, a runnable Jupyter notebook that
 exercises every `/v2` endpoint against a real FITS file and is a good first thing to run against a fresh clone.
 
+## Releasing
+
+Releases are cut by pushing a `vX.Y.Z` tag, which triggers `.github/workflows/release.yml` to build the
+static musl binary. The crate version in `Cargo.toml` **must** match the tag — the binary reports it at
+runtime (startup log, `/health`, FITS headers). So bump `Cargo.toml` (and `Cargo.lock`), commit
+`chore(release): vX.Y.Z`, then tag that commit.
+
+Two guards enforce the match so a mislabeled build can't ship:
+
+- **CI** — the release workflow fails fast if the tag and `Cargo.toml` version disagree.
+- **Local pre-push hook** (`.githooks/pre-push`) — blocks the push before it leaves your machine. Hooks
+  aren't shared automatically, so enable it once per clone:
+
+  ```bash
+  git config core.hooksPath .githooks
+  ```
+
 ## Agent-assisted development
 
 This repo uses [Sandcastle](https://github.com/mattpocock/sandcastle) to run GitHub issues through an
