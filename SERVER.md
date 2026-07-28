@@ -374,3 +374,370 @@ All calibration arrays and numeric fields are optional. `result_prefix` prepends
 ```json
 { "job_id": "...", "status": "running", "slots": ["pipe/Ha", "pipe/OIII"] }
 ```
+
+---
+
+## v2 API
+
+The `/v2/*` endpoints are a newer, agent-oriented surface for inspecting and
+analysing a single image at a time. They share the session model and error
+envelope above, but use their own **ref-based image model** instead of v1's
+free-form cache slots. All v2 routes are prefixed `/v2/sessions/:sid/...`.
+
+Session creation is shared with v1: `POST /sessions` (or `POST /v2/sessions`)
+returns a `session_id`. Everything else below is scoped under it.
+
+### Concepts
+
+**Image refs.** Opening a file registers an *image ref* — a short id like
+`img_0`. Derived operations mint their own (`cutout_1`, `bin_1`). One ref per
+session is the **active ref**; almost every endpoint accepts an explicit target
+via `ref` (alias `image_ref`, and on some routes `image`) and otherwise falls
+back to the active ref. With neither, the response is `400 bad_request`
+(*"no active image in this session; open a file first"*). Opening, switching
+HDU, cutout, and bin each set the new ref active.
+
+**RegionSpec.** Endpoints that operate on a sub-region (`stats`, `histogram`,
+`render`, `cutout`) take a `region` object, a tagged union on `type`:
+
+```json
+{ "type": "pixel", "x": 0, "y": 0, "width": 512, "height": 512, "clip": false }
+```
+```json
+{ "type": "sky", "ra": 150.113, "dec": 2.205, "size_arcmin": 5.0, "clip": false }
+```
+
+- `pixel` — lower-left corner `(x, y)` (0-indexed; `x`=column, `y`=row) and size in pixels.
+- `sky` — box centred on ICRS `(ra, dec)` in degrees; `size_arcmin` is either a single number (square) or `[width, height]` in arcmin. Requires a WCS on the image.
+- `clip` *(default `false`)* — for `stats`/`histogram`, clamp an over-hanging region to the image instead of erroring `region_out_of_bounds`. `render` always clamps and ignores `clip`; `cutout` NaN-fills off-frame pixels and ignores `clip`.
+
+**Errors.** Same envelope as v1 (`{ "success": false, "error": { "code", "message", "hint"? } }`). v2 adds a few `code`s: `wcs_required` (region/transform needs a WCS the image lacks), `region_out_of_bounds`, `pixel_out_of_bounds`, `not_implemented`.
+
+---
+
+### Sessions & lifecycle
+
+#### `GET /v2/sessions`
+
+List all live sessions (for dashboards). No body. Does **not** refresh any session's idle TTL.
+
+**Response `200`:**
+```json
+{
+  "count": 1,
+  "sessions": [
+    { "session_id": "a1b2…", "created_unix": 1752460800, "idle_secs": 12,
+      "active_ref": "img_0", "image_count": 1, "cache_bytes": 4194304,
+      "running_jobs": 0, "last_seq": 7 }
+  ]
+}
+```
+
+#### `GET /v2/sessions/:sid`
+
+Session status snapshot.
+
+**Response `200`:**
+```json
+{ "session_id": "a1b2…", "active_ref": "img_0", "image_count": 1, "cache_bytes": 4194304 }
+```
+
+#### `DELETE /v2/sessions/:sid`
+
+Destroy the session. **Response `204 No Content`**, empty body.
+
+#### `GET /v2/sessions/:sid/history`
+
+Replay the per-session activity ring (capacity 200), oldest-first. Excludes its own polling routes (`history`, `images`, `keepalive`, bare status/DELETE), so polling doesn't pollute the log. Does not refresh idle TTL.
+
+**Query params:** `since_seq` *(u64, default 0)* — only events with `seq` greater than this; `limit` *(usize, optional)* — cap, newest kept.
+
+**Response `200`:**
+```json
+{
+  "session_id": "a1b2…", "first_seq": 51, "last_seq": 60,
+  "events": [
+    { "seq": 52, "unix_ms": 1752460812345, "method": "POST", "endpoint": "open",
+      "image_ref": "img_0", "status": 200, "duration_ms": 8 }
+  ]
+}
+```
+`first_seq > since_seq + 1` signals the ring overflowed and events were lost.
+
+#### `POST /v2/sessions/:sid/keepalive`
+
+Refresh the session's idle TTL without doing work. No body.
+
+**Response `200`:** `{ "session_id": "a1b2…", "status": "ok" }`
+
+---
+
+### Images
+
+#### `POST /v2/sessions/:sid/open`
+
+Load a FITS/ASDF file from the server filesystem into a new ref (made active). Never mutates or evicts existing refs.
+
+**Body:** `path` *(string, required)*; `hdu` *(int, optional)* — HDU index, omitted auto-selects the first image HDU (must be omitted for ASDF); `name` *(string, optional)* — explicit ref name, else `img_N`.
+
+**Response `200`:**
+```json
+{
+  "ref": "img_0", "active_ref": "img_0",
+  "dims": [2048, 1489], "hdu": 1, "extname": "SCI", "wcs_present": true,
+  "stats": { "min": 0.0, "max": 65535.0, "median": 102.5, "mad": 3.1,
+             "sigma": 4.6, "mean": 110.2, "valid_count": 3049472 },
+  "header": { "SIMPLE": true, "BITPIX": -32, "…": "…" },
+  "io": "mmap"
+}
+```
+`dims` is `[cols, rows]` (width, height) — this ordering is used by every v2 response. `hdu` is `null` when auto-selected. `io` is the resolved byte-source policy (`mmap`/`read`/`null`). A bad path/HDU (or an `hdu` passed to ASDF) is `500 internal_error`.
+
+#### `POST /v2/sessions/:sid/hdu`
+
+Load a different HDU from the **active ref's** source file into a new active ref.
+
+**Body:** `hdu` *(int, required)*; `name` *(string, optional)*.
+
+**Response `200`:** same shape as `open` (here `hdu` is always the requested index). `400 bad_request` if there's no active ref or it has no source file.
+
+#### `GET /v2/sessions/:sid/images`
+
+List the session's refs, sorted by id.
+
+**Response `200`:**
+```json
+{
+  "active_ref": "img_1", "count": 2,
+  "images": [
+    { "image_ref": "img_0", "source": "/data/x.fits", "hdu": 1,
+      "width": 2048, "height": 1489, "wcs_present": true, "extname": "SCI" }
+  ]
+}
+```
+`source` is `null` for derived refs (cutout/bin).
+
+---
+
+### Inspection
+
+#### `GET /v2/sessions/:sid/structure`
+
+FITS-only HDU listing (reads the source file). **Query:** `ref` (alias `image`).
+
+**Response `200`:**
+```json
+{
+  "ref": "img_1", "count": 2,
+  "hdus": [
+    { "index": 0, "extname": "PRIMARY", "extver": 1, "naxis": 0, "shape": [],
+      "bitpix": 8, "dtype": "uint8", "has_data": false },
+    { "index": 1, "extname": "SCI", "extver": 1, "naxis": 2, "shape": [1489, 2048],
+      "bitpix": -32, "dtype": "float32", "has_data": true }
+  ]
+}
+```
+`shape` is row-major (`[ny, nx]`). `400 bad_request` if the ref has no source file or the source is ASDF.
+
+#### `GET /v2/sessions/:sid/header`
+
+Return header cards. **Query:** `ref` (alias `image`); `keys` *(optional)* — comma-separated keywords or shell globs (`CD*_*`), case-insensitive; omitted returns the full header.
+
+**Response `200`:**
+```json
+{ "ref": "img_1", "count": 2,
+  "cards": { "EXPTIME": { "value": "120.0" }, "FILTER": { "value": "r" } } }
+```
+`400 bad_request` if the ref carries no header (re-open to attach one).
+
+#### `GET /v2/sessions/:sid/wcs`
+
+WCS summary. **Query:** `ref` (alias `image`).
+
+**Response `200` (WCS present):**
+```json
+{
+  "ref": "img_1", "present": true, "projection": "TAN",
+  "crpix": [1024.5, 1024.5], "crval": [150.113, 2.205],
+  "cd": [[-1.38e-5, 0.0], [0.0, 1.38e-5]],
+  "pixel_scale_arcsec": 0.05, "pixel_scale_x_arcsec": 0.05, "pixel_scale_y_arcsec": 0.05,
+  "rotation_deg": 0.0, "flipped": true, "parity": "flipped", "sip_present": false
+}
+```
+When no usable WCS exists this is **not** an error — it returns `{ "ref": "…", "present": false }`.
+
+---
+
+### WCS coordinate transforms
+
+All three accept a target `ref` (alias `image_ref`); `points` are processed in
+order. `400 wcs_required` if the image has no usable WCS.
+
+#### `POST /v2/sessions/:sid/wcs/pix2sky`
+
+**Body:** `points` *(array of `[x, y]`, 0-based pixels, required)*; `ref` *(optional)*.
+
+**Response `200`:**
+```json
+{ "ref": "img_1", "count": 1,
+  "results": [ { "x": 100.0, "y": 200.0, "ra": 150.12, "dec": 2.19, "on_image": true } ] }
+```
+
+#### `POST /v2/sessions/:sid/wcs/sky2pix`
+
+**Body:** `points` *(array of `[ra, dec]`, ICRS deg, required)*; `ref` *(optional)*.
+
+**Response `200`:**
+```json
+{ "ref": "img_1", "count": 1,
+  "results": [ { "ra": 150.12, "dec": 2.19, "x": 100.3, "y": 200.7, "on_image": true } ] }
+```
+
+#### `POST /v2/sessions/:sid/wcs/separation`
+
+Angular separation between two points. Tagged on `type`:
+
+**Body (sky — no WCS needed):** `{ "type": "sky", "a": [ra, dec], "b": [ra, dec] }`
+**Body (pixel — via WCS):** `{ "type": "pixel", "a": [x, y], "b": [x, y], "ref": "img_1" }`
+
+**Response `200`:**
+```json
+{ "separation_deg": 0.1414, "separation_arcmin": 8.485, "separation_arcsec": 509.1 }
+```
+The `pixel` variant additionally returns `ref`, `a_sky`, `b_sky` (the projected `[ra, dec]`), and `400 region_out_of_bounds` if a point doesn't project onto the sky.
+
+---
+
+### Pixel / stats / histogram
+
+#### `POST /v2/sessions/:sid/pixel`
+
+Value at a pixel plus a neighbourhood summary and sky coords. Read-only.
+
+**Body:** `x`, `y` *(f64, required, 0-based)*; `box` *(int, default `1`)* — neighbourhood side length; `ref` *(optional)*.
+
+**Response `200`:**
+```json
+{
+  "ref": "img_1", "x": 512.0, "y": 480.0, "value": 1203.5, "box": 5,
+  "neighborhood": { "min": 10.2, "max": 1203.5, "mean": 245.7, "n_pixels": 24, "n_nan": 1 },
+  "sky": { "ra": 150.113, "dec": 2.205 }
+}
+```
+`value` is `null` at a NaN pixel; `sky` is `null` without a WCS. `400 pixel_out_of_bounds` if `(⌊x⌋, ⌊y⌋)` is outside the image.
+
+#### `POST /v2/sessions/:sid/stats`
+
+Region statistics, optional sigma-clip and percentiles.
+
+**Body:** `ref` *(optional)*; `region` *(optional, default full frame)*; `sigma_clip` *(optional object `{ "sigma": 3.0, "maxiters": 5 }`)*; `percentiles` *(optional array, 0–100)*.
+
+**Response `200`:**
+```json
+{
+  "ref": "img_0",
+  "region": { "x": 0, "y": 0, "width": 512, "height": 512, "clipped": false },
+  "min": 0.12, "max": 30122.0, "median": 210.5, "mad": 12.3, "sigma": 18.2,
+  "mean": 215.7, "valid_count": 262100, "n_nan": 44,
+  "clipped": { "mean": 214.9, "median": 210.4, "std": 15.1, "n_rejected": 320 },
+  "percentiles": [ { "percentile": 99.5, "value": 1024.0 } ]
+}
+```
+`clipped` appears only if `sigma_clip` was given; `percentiles` only if the input array was non-empty.
+
+#### `POST /v2/sessions/:sid/histogram`
+
+**Body:** `ref` *(optional)*; `region` *(optional)*; `bins` *(int, default `256`, must be > 0)*; `range` *(optional `[lo, hi]`, default robust 0.1–99.9th percentile)*; `log_counts` *(bool, default `false`)* — return `ln(1 + count)`.
+
+**Response `200`:**
+```json
+{
+  "ref": "img_0",
+  "region": { "x": 0, "y": 0, "width": 512, "height": 512, "clipped": false },
+  "bins": [0, 3, 44, 120],
+  "bin_edges": [0.1, 1.2, 2.3, 3.4, 4.5],
+  "min": 0.1, "max": 1024.0, "log_counts": false, "range_source": "auto", "mode": 210.5
+}
+```
+`bin_edges` has `bins + 1` entries; `range_source` is `"explicit"` or `"auto"`; `mode` is the center of the most-populated bin (`null` if empty).
+
+---
+
+### Derived refs — cutout & bin
+
+Both crop/reduce into a **new active ref** and return the same core body shape
+as `open` (`ref`, `active_ref`, `dims`, `stats`, …), plus op-specific fields.
+
+#### `POST /v2/sessions/:sid/cutout`
+
+Crop a region into a new ref. Tolerates partial/zero overlap (off-frame → NaN).
+
+**Body:** `region` *(RegionSpec, required)*; `ref` *(optional source)*; `name` *(optional, else `cutout_N`)*; `preserve_wcs` *(bool, default `true`)* — shift the parent WCS into the cutout header.
+
+**Response `200`** adds `fraction_on_image` (1.0 = fully inside) and `region` (the resolved crop rect in parent pixels; `x`/`y` may be negative). `hdu`/`extname` are `null` for the derived ref.
+
+#### `POST /v2/sessions/:sid/bin`
+
+Block-average rebin by an integer factor; drops WCS.
+
+**Body:** `factor` *(int, required, > 0)* — `out_dims = in_dims / factor` (floor); `method` *(string, default `"mean"`; only `"mean"`)*; `ref` *(optional)*; `name` *(optional, else `bin_N`)*.
+
+**Response `200`** adds `from_ref`, `factor`, `method`; `wcs_present` is always `false`. `400 bad_request` if `factor` exceeds the image dims or `method` isn't `"mean"`.
+
+---
+
+### Render (PNG)
+
+#### `POST /v2/sessions/:sid/render`
+
+The agent-facing render endpoint. Returns a raw **`image/png`** (RGB8). A
+response header **`x-render-resolved`** carries a JSON string of the resolved
+parameters (vmin/vmax, algorithm, stretch, binning, pixel scale, clipped
+fractions). The region always clamps to the image — it never errors
+`region_out_of_bounds`.
+
+**Body (all optional except an available ref):**
+
+| Field | Default | Meaning |
+|---|---|---|
+| `ref` (alias `image`) | active ref | Target image |
+| `region` | full frame | RegionSpec; always clamped |
+| `scale` | zscale + linear | Scale/stretch config (below) |
+| `colormap` | `"gray"` | `gray` or `viridis` |
+| `invert_cmap` | `false` | Invert the colormap |
+| `max_dim` | none | Long-side cap; bins down by `ceil(max(w,h)/max_dim)` |
+| `overlays` | `[]` | `crosshair` (`x,y` or `ra,dec`) and `scalebar` (`length_arcsec`; needs WCS) |
+
+`scale` fields: `algorithm` *(`zscale`\|`minmax`\|`percentile`\|`manual`, default `zscale`)*, `stretch` *(`linear`\|`log`\|`sqrt`\|`asinh`\|`power`, default `linear`)*, `vmin`/`vmax` *(for `manual`)*, `percentile` *(`[lo, hi]`, default `[1.0, 99.5]`)*, `asinh_a` *(default `0.1`)*, `power` *(default `2.0`)*, `zscale_contrast`.
+
+**Body:**
+```json
+{ "ref": "img_0", "scale": { "algorithm": "zscale", "stretch": "asinh", "asinh_a": 0.1 },
+  "colormap": "viridis", "max_dim": 1024 }
+```
+
+Unknown `algorithm`/`stretch`/`colormap` → `400 bad_request` (with a hint listing valid values).
+
+---
+
+### Export — compressed FITS
+
+#### `POST /v2/sessions/:sid/export/compressed`
+
+Download a RICE_1-compressed copy of a ref's **source** MEF. Returns
+`application/fits` as an attachment (`filename="<ref>_compressed.fits"`).
+
+**Body:** `ref` *(alias `image`/`image_ref`, optional — defaults to active ref)*; `quantize_level` *(f64, default `16.0`)* — noise-relative float quantization; smaller = more aggressive/lossy = smaller file.
+
+**Requires a ref with a source file on disk** — derived refs (cutout/bin) have
+none and return `400 bad_request`. `404` if the ref isn't in the session.
+
+```bash
+curl -X POST http://localhost:8080/v2/sessions/$SID/export/compressed \
+  -H 'Content-Type: application/json' \
+  -d '{"ref":"img_0","quantize_level":16.0}' \
+  -o img_0_compressed.fits
+```
+
+The RICE_1 row encoding is parallelised across cores; bound it with
+`RAYON_NUM_THREADS` (see [Configuration](#configuration)).
