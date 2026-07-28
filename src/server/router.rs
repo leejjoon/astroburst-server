@@ -76,6 +76,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v2/sessions/:sid/render", routing::post(v2::render::handler::render))
         // ── v2 API: compressed FITS export/download ──────────────────────────
         .route("/v2/sessions/:sid/export/compressed", routing::post(v2::export::export_compressed))
+        // ── v2 API: filesystem discovery — session-independent, mounted at
+        // /v2/fs so agents can browse/stat server-side paths before `open`.
+        .route("/v2/fs/list", routing::post(v2::fs::list))
+        .route("/v2/fs/exists", routing::post(v2::fs::exists))
         // Record session-scoped requests into the session's activity ring
         // (issue #3). Layered before with_state consumes `state`.
         .layer(middleware::from_fn_with_state(

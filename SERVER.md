@@ -476,7 +476,52 @@ HDU, cutout, and bin each set the new ref active.
 - `sky` — box centred on ICRS `(ra, dec)` in degrees; `size_arcmin` is either a single number (square) or `[width, height]` in arcmin. Requires a WCS on the image.
 - `clip` *(default `false`)* — for `stats`/`histogram`, clamp an over-hanging region to the image instead of erroring `region_out_of_bounds`. `render` always clamps and ignores `clip`; `cutout` NaN-fills off-frame pixels and ignores `clip`.
 
-**Errors.** Same envelope as v1 (`{ "success": false, "error": { "code", "message", "hint"? } }`). v2 adds a few `code`s: `wcs_required` (region/transform needs a WCS the image lacks), `region_out_of_bounds`, `pixel_out_of_bounds`, `not_implemented`.
+**Errors.** Same envelope as v1 (`{ "success": false, "error": { "code", "message", "hint"? } }`). v2 adds a few `code`s: `wcs_required` (region/transform needs a WCS the image lacks), `region_out_of_bounds`, `pixel_out_of_bounds`, `not_implemented`, `fs_not_found`, `not_a_directory`.
+
+---
+
+### Filesystem discovery
+
+Two read-only endpoints for finding server-side files before opening them. They
+are **session-independent** (discovery precedes session creation), so they mount
+at `/v2/fs/*` with no `:sid`. There is no path confinement — the same arbitrary
+paths `open` already accepts.
+
+#### `POST /v2/fs/list`
+
+Non-recursive directory listing.
+
+**Body:** `path` *(string, required)* — directory to list; `glob` *(string, optional)* — shell-style filter on the entry **name** (`*` any run, `?` one char; case-sensitive), e.g. `*.fits`; `include_hidden` *(bool, default `false`)* — include dotfiles.
+
+**Response `200`:**
+```json
+{
+  "path": "/data",
+  "count": 2,
+  "entries": [
+    { "name": "raw",         "type": "dir",  "size": null,     "modified_unix": 1785224000 },
+    { "name": "m51_ha.fits", "type": "file", "size": 10298880, "modified_unix": 1785224421 }
+  ]
+}
+```
+`type` is `file`/`dir`/`symlink`/`other`; `size` is bytes for files, `null` otherwise. Entries are ordered directories-first, then by name. `400 fs_not_found` if the path doesn't exist; `400 not_a_directory` if it's a file.
+
+#### `POST /v2/fs/exists`
+
+Stat a single path. A missing path is `exists: false`, **not** an error.
+
+**Body:** `path` *(string, required)*.
+
+**Response `200`:**
+```json
+{ "path": "/data/m51_ha.fits", "exists": true, "type": "file", "size": 10298880, "modified_unix": 1785224421 }
+```
+Symlinks are followed (matching `open`), so a dangling link reads as `exists: false`.
+
+```bash
+curl -X POST http://localhost:8080/v2/fs/list \
+  -H 'Content-Type: application/json' -d '{"path":"/data","glob":"*.fits"}'
+```
 
 ---
 
