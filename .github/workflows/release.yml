@@ -14,6 +14,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify tag matches Cargo.toml version
+        # Guards against tagging a release whose crate version was not bumped:
+        # the binary reports CARGO_PKG_VERSION at runtime (startup log, /health,
+        # FITS headers), so a mismatch ships a mislabeled build. Fail fast here
+        # instead. Reads the first `version =` line, which is the [package] one.
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CRATE="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          if [ "$TAG" != "$CRATE" ]; then
+            echo "::error::tag v$TAG does not match Cargo.toml version $CRATE"
+            exit 1
+          fi
+          echo "OK: tag and crate version both $CRATE"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
