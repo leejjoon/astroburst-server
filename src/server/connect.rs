@@ -32,6 +32,10 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 const DEFAULT_REMOTE_PORT: u16 = 8097;
+/// Local end of the tunnel when `--local-port` is omitted — fixed (matching the
+/// remote default) so the URL is stable across runs. Pass `--local-port 0` for a
+/// random free port instead (e.g. to run several `connect` sessions at once).
+const DEFAULT_LOCAL_PORT: u16 = 8097;
 /// Detect a dead peer within ~45s (15s x 3) instead of leaving a zombie
 /// tunnel that only fails at the next client request.
 const SERVER_ALIVE_INTERVAL: u32 = 15;
@@ -46,7 +50,8 @@ const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct ConnectOptions {
     pub target: SshTarget,
     pub remote_port: u16,
-    /// `None` = pick a free port automatically.
+    /// Local end of the tunnel. `None` → `DEFAULT_LOCAL_PORT` (stable across
+    /// runs); `Some(0)` → a random free port; `Some(p)` → exactly `p`.
     pub local_port: Option<u16>,
     pub json: bool,
     pub reconnect: bool,
@@ -185,7 +190,8 @@ pub fn parse_args(args: &[String]) -> Result<ConnectOptions> {
                     "usage: astroburst-server connect <ssh-target> \
                      [--remote-port N] [--local-port N] [--json] [--tui] \
                      [--no-reconnect] [--max-retries N] [--start] [--remote-bin PATH]\n\
-                     <ssh-target>: an ~/.ssh/config alias/hostname, or ssh://user@host[:sshport]"
+                     <ssh-target>: an ~/.ssh/config alias/hostname, or ssh://user@host[:sshport]\n\
+                     --local-port defaults to {DEFAULT_LOCAL_PORT}; pass 0 for a random free port"
                 );
             }
             other if target.is_none() => target = Some(parse_target(other)?),
@@ -454,8 +460,11 @@ pub fn next_backoff(current: Duration) -> Duration {
 pub fn run(args: &[String]) -> Result<()> {
     let opts = parse_args(args)?;
     let local_port = match opts.local_port {
+        // `--local-port 0` explicitly opts into a random free port.
+        Some(0) => pick_free_port()?,
         Some(p) => p,
-        None => pick_free_port()?,
+        // Omitted → fixed default, so the local URL is stable across runs.
+        None => DEFAULT_LOCAL_PORT,
     };
 
     if opts.tui {
