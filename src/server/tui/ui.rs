@@ -18,7 +18,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use super::app::{
-    fmt_age, fmt_bytes, short_id, App, Detail, Tab, TunnelPhase, TunnelState,
+    fmt_age, fmt_bytes, short_id, App, Detail, HistoryEvent, Tab, TunnelPhase, TunnelState,
 };
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -125,6 +125,7 @@ fn tab_title(tab: Tab) -> &'static str {
     match tab {
         Tab::Overview => "Overview",
         Tab::History => "History",
+        Tab::Global => "Global",
         Tab::Tunnel => "Tunnel",
     }
 }
@@ -145,6 +146,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     match app.tab {
         Tab::Overview => draw_overview(frame, app, content),
         Tab::History => draw_history(frame, app, content),
+        Tab::Global => draw_global_activity(frame, app, content),
         Tab::Tunnel => draw_tunnel(frame, app, content),
     }
 }
@@ -232,16 +234,40 @@ fn basename(path: &str) -> String {
 fn draw_history(frame: &mut Frame, app: &App, area: Rect) {
     let empty = Detail::default();
     let detail = app.detail.as_ref().unwrap_or(&empty);
+    draw_event_table(frame, area, &detail.history, app.history_scroll, "History", "ref");
+}
+
+fn draw_global_activity(frame: &mut Frame, app: &App, area: Rect) {
+    // Sessionless /v2/fs/* calls; the `ref` column carries the request query.
+    draw_event_table(
+        frame,
+        area,
+        &app.global_activity,
+        app.global_scroll,
+        "Global activity",
+        "query",
+    );
+}
+
+/// Shared renderer for an activity event table (per-session History and the
+/// sessionless Global feed). Tail-follows the newest rows, shifted back by
+/// `scroll`; `ref_header` labels the `image_ref`/query column.
+fn draw_event_table(
+    frame: &mut Frame,
+    area: Rect,
+    events: &[HistoryEvent],
+    scroll: usize,
+    title_label: &str,
+    ref_header: &str,
+) {
     let now_ms = now_unix() * 1000;
 
-    // Tail-follow with a scroll offset: show the newest rows that fit,
-    // shifted back by `history_scroll`.
     let visible = area.height.saturating_sub(3) as usize; // borders + header row
-    let total = detail.history.len();
-    let end = total.saturating_sub(app.history_scroll);
+    let total = events.len();
+    let end = total.saturating_sub(scroll);
     let start = end.saturating_sub(visible);
 
-    let rows: Vec<Row> = detail.history[start..end]
+    let rows: Vec<Row> = events[start..end]
         .iter()
         .map(|e| {
             let status_style = if e.status < 400 {
@@ -264,10 +290,10 @@ fn draw_history(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let title = if app.history_scroll > 0 {
-        format!(" History ({total} events, ↑{}) ", app.history_scroll)
+    let title = if scroll > 0 {
+        format!(" {title_label} ({total} events, ↑{scroll}) ")
     } else {
-        format!(" History ({total} events) ")
+        format!(" {title_label} ({total} events) ")
     };
     let table = Table::new(
         rows,
@@ -282,7 +308,7 @@ fn draw_history(frame: &mut Frame, app: &App, area: Rect) {
         ],
     )
     .header(
-        Row::new(vec!["seq", "when", "meth", "endpoint", "ref", "st", "took"])
+        Row::new(vec!["seq", "when", "meth", "endpoint", ref_header, "st", "took"])
             .style(Style::new().add_modifier(Modifier::BOLD)),
     )
     .block(Block::default().borders(Borders::ALL).title(title));
@@ -439,6 +465,15 @@ mod tests {
                     duration_ms: 249,
                 }],
             }),
+            global_activity: vec![HistoryEvent {
+                seq: 1,
+                unix_ms: 1,
+                method: "GET".into(),
+                endpoint: "/v2/fs/raw".into(),
+                image_ref: Some("path=/data/656nmos.fits&compress=lossless".into()),
+                status: 200,
+                duration_ms: 612,
+            }],
             error: None,
         });
         app
@@ -467,6 +502,17 @@ mod tests {
         assert!(screen.contains("POST"));
         assert!(screen.contains("249ms"));
         assert!(screen.contains("History (1 events)"));
+    }
+
+    #[test]
+    fn global_tab_renders_fs_activity() {
+        let mut app = populated_app();
+        app.tab = Tab::Global;
+        let screen = render(&app);
+        assert!(screen.contains("Global activity (1 events)"), "{screen}");
+        assert!(screen.contains("/v2/fs/raw"), "{screen}");
+        assert!(screen.contains("612ms"));
+        assert!(screen.contains("query"), "query column header missing:\n{screen}");
     }
 
     #[test]

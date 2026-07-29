@@ -125,6 +125,28 @@ fn is_excluded(method: &str, endpoint: &str) -> bool {
         || (method == "GET" && endpoint.starts_with("jobs/"))
 }
 
+/// True for sessionless paths recorded into the process-global activity ring:
+/// the `/v2/fs/*` data endpoints. Everything else non-session (`/health`, the
+/// session list/create, the `GET /v2/activity` read itself) is deliberately
+/// excluded so the ring isn't flooded by the dashboard's own polling.
+fn global_endpoint(path: &str) -> bool {
+    path.starts_with("/v2/fs/")
+}
+
+/// Shorten a query string for display in the activity feed (the `image_ref`
+/// column is repurposed to carry it for global events). `None` for empty.
+fn truncate_query(query: &str) -> Option<String> {
+    const MAX: usize = 80;
+    if query.is_empty() {
+        return None;
+    }
+    let mut s: String = query.chars().take(MAX).collect();
+    if query.chars().count() > MAX {
+        s.push('…');
+    }
+    Some(s)
+}
+
 /// Extract `image_ref` (or `target_ref`) from a JSON request body.
 fn ref_from_body(bytes: &[u8]) -> Option<String> {
     let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
@@ -151,6 +173,27 @@ pub async fn record_activity(
         _ => None,
     };
     let Some((sid, endpoint)) = target else {
+        // Not session-scoped. Record the sessionless data endpoints (`/v2/fs/*`)
+        // into the process-global ring; everything else passes through untouched.
+        if global_endpoint(&path) {
+            let query = req.uri().query().and_then(truncate_query);
+            let started = Instant::now();
+            let response = next.run(req).await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            state.global_activity.record(ActivityEvent {
+                seq: 0, // assigned by record()
+                unix_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                method,
+                endpoint: path,
+                image_ref: query,
+                status: response.status().as_u16(),
+                duration_ms,
+            });
+            return response;
+        }
         return next.run(req).await;
     };
 
@@ -294,5 +337,30 @@ mod tests {
         );
         assert_eq!(ref_from_body(br#"{"path":"/x.fits"}"#), None);
         assert_eq!(ref_from_body(b"not json"), None);
+    }
+
+    #[test]
+    fn global_endpoint_matches_only_fs() {
+        assert!(global_endpoint("/v2/fs/raw"));
+        assert!(global_endpoint("/v2/fs/list"));
+        assert!(global_endpoint("/v2/fs/exists"));
+        // Not recorded globally: infra + the dashboard's own polling targets.
+        assert!(!global_endpoint("/health"));
+        assert!(!global_endpoint("/v2/sessions"));
+        assert!(!global_endpoint("/v2/activity"));
+        assert!(!global_endpoint("/v2/sessions/abc/open"));
+    }
+
+    #[test]
+    fn truncate_query_shortens_and_drops_empty() {
+        assert_eq!(truncate_query(""), None);
+        assert_eq!(
+            truncate_query("path=/data/x.fits&compress=lossless"),
+            Some("path=/data/x.fits&compress=lossless".to_string())
+        );
+        let long = "a".repeat(200);
+        let got = truncate_query(&long).unwrap();
+        assert_eq!(got.chars().count(), 81); // 80 chars + ellipsis
+        assert!(got.ends_with('…'));
     }
 }

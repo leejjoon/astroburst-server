@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use tokio::sync::Semaphore;
 
+use super::activity::ActivityLog;
 use super::config::ServerConfig;
 use super::session::{Session, SessionId, SessionManager};
 
@@ -14,6 +15,9 @@ pub struct AppState {
     pub config: Arc<ServerConfig>,
     /// Monotonically increasing count of sessions ever created (for /health).
     pub created_total: Arc<AtomicU64>,
+    /// Activity ring for requests not bound to any session (the `/v2/fs/*`
+    /// endpoints) — surfaced by `GET /v2/activity` and the TUI's Global tab.
+    pub global_activity: Arc<ActivityLog>,
 }
 
 impl AppState {
@@ -24,6 +28,7 @@ impl AppState {
             job_semaphore,
             config,
             created_total: Arc::new(AtomicU64::new(0)),
+            global_activity: Arc::new(ActivityLog::new()),
         }
     }
 

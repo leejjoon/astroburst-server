@@ -92,6 +92,8 @@ pub struct Snapshot {
     pub latency: Option<Duration>,
     pub sessions: Vec<SessionSummary>,
     pub detail: Option<Detail>,
+    /// Sessionless `/v2/fs/*` activity (from `GET /v2/activity`).
+    pub global_activity: Vec<HistoryEvent>,
     pub error: Option<String>,
 }
 
@@ -137,6 +139,7 @@ impl TunnelState {
 pub enum Tab {
     Overview,
     History,
+    Global,
     Tunnel,
 }
 
@@ -150,9 +153,13 @@ pub struct App {
     /// Selection is tracked by id so it survives list reordering/removal.
     pub selected_sid: Option<String>,
     pub detail: Option<Detail>,
+    /// Sessionless `/v2/fs/*` activity (Global tab); not tied to a selection.
+    pub global_activity: Vec<HistoryEvent>,
     pub tab: Tab,
     /// History-pane scroll offset from the tail (0 = follow newest).
     pub history_scroll: usize,
+    /// Global-activity-pane scroll offset from the tail (0 = follow newest).
+    pub global_scroll: usize,
     pub tunnel: Option<TunnelState>,
     /// Session id awaiting delete confirmation (modal open).
     pub confirm_delete: Option<String>,
@@ -177,8 +184,10 @@ impl App {
             sessions: Vec::new(),
             selected_sid: None,
             detail: None,
+            global_activity: Vec::new(),
             tab: Tab::Overview,
             history_scroll: 0,
+            global_scroll: 0,
             tunnel,
             confirm_delete: None,
             should_quit: false,
@@ -197,9 +206,9 @@ impl App {
     /// Tabs available right now (Tunnel only exists under `connect --tui`).
     pub fn tabs(&self) -> Vec<Tab> {
         if self.tunnel.is_some() {
-            vec![Tab::Overview, Tab::History, Tab::Tunnel]
+            vec![Tab::Overview, Tab::History, Tab::Global, Tab::Tunnel]
         } else {
-            vec![Tab::Overview, Tab::History]
+            vec![Tab::Overview, Tab::History, Tab::Global]
         }
     }
 
@@ -210,6 +219,7 @@ impl App {
         self.latency = snap.latency.or(self.latency);
         self.error = snap.error;
         self.sessions = snap.sessions;
+        self.global_activity = snap.global_activity;
 
         // Keep the selection pinned to its session; fall back to the first
         // entry when it vanished (deleted / TTL-evicted) or nothing was
@@ -339,16 +349,29 @@ impl App {
                 Action::None
             }
             "pageup" => {
-                let len = self.detail.as_ref().map_or(0, |d| d.history.len());
-                self.history_scroll = (self.history_scroll + 10).min(len.saturating_sub(1));
+                if self.tab == Tab::Global {
+                    let len = self.global_activity.len();
+                    self.global_scroll = (self.global_scroll + 10).min(len.saturating_sub(1));
+                } else {
+                    let len = self.detail.as_ref().map_or(0, |d| d.history.len());
+                    self.history_scroll = (self.history_scroll + 10).min(len.saturating_sub(1));
+                }
                 Action::None
             }
             "pagedown" => {
-                self.history_scroll = self.history_scroll.saturating_sub(10);
+                if self.tab == Tab::Global {
+                    self.global_scroll = self.global_scroll.saturating_sub(10);
+                } else {
+                    self.history_scroll = self.history_scroll.saturating_sub(10);
+                }
                 Action::None
             }
             "end" => {
-                self.history_scroll = 0;
+                if self.tab == Tab::Global {
+                    self.global_scroll = 0;
+                } else {
+                    self.history_scroll = 0;
+                }
                 Action::None
             }
             _ => Action::None,
@@ -459,11 +482,13 @@ mod tests {
         app.on_key("tab");
         assert_eq!(app.tab, Tab::History);
         app.on_key("tab");
-        assert_eq!(app.tab, Tab::Overview); // no Tunnel tab without a tunnel
+        assert_eq!(app.tab, Tab::Global);
+        app.on_key("tab");
+        assert_eq!(app.tab, Tab::Overview); // wraps; no Tunnel tab without a tunnel
 
         app.tunnel = Some(TunnelState::new("olaf1".into()));
         app.on_key("backtab");
-        assert_eq!(app.tab, Tab::Tunnel);
+        assert_eq!(app.tab, Tab::Tunnel); // Tunnel now present: backtab from Overview
     }
 
     #[test]

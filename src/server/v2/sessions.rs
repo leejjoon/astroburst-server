@@ -96,6 +96,27 @@ pub async fn history(
     })))
 }
 
+/// GET /v2/activity?since_seq=N&limit=M
+///
+/// The process-global activity ring: requests not bound to any session (the
+/// `/v2/fs/*` data endpoints). Same shape/semantics as the per-session
+/// `history` endpoint, minus `session_id`. Not itself recorded (see
+/// `activity::global_endpoint`), so the dashboard can poll it freely.
+pub async fn global_activity(
+    Query(params): Query<HistoryParams>,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let (events, first_seq, last_seq) = state
+        .global_activity
+        .events_since(params.since_seq, params.limit.unwrap_or(usize::MAX));
+
+    Json(json!({
+        "first_seq": first_seq,
+        "last_seq": last_seq,
+        "events": events,
+    }))
+}
+
 /// GET /v2/sessions/:sid
 ///
 /// Session status: active ref, number of registered images, and memory

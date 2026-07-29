@@ -207,6 +207,11 @@ fn poll_once(base_url: &str, selected: Option<&str>) -> Snapshot {
         }
     }
 
+    // Sessionless /v2/fs/* activity (Global tab) — independent of any selection.
+    if let Ok((json, _)) = client::get_json(base_url, "/v2/activity") {
+        snap.global_activity = serde_json::from_value(json["events"].clone()).unwrap_or_default();
+    }
+
     if let Some(sid) = selected {
         if snap.sessions.iter().any(|s| s.session_id == sid) {
             let mut detail = Detail { session_id: sid.to_string(), ..Default::default() };

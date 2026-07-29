@@ -83,6 +83,9 @@ pub fn build_router(state: AppState) -> Router {
         // Stateless raw byte transfer — streams a file verbatim, honors Range,
         // and (taking no session/state) is outside the SESSION_MAX/JOBS_MAX caps.
         .route("/v2/fs/raw", routing::get(v2::fs::raw_get).head(v2::fs::raw_head))
+        // Sessionless activity ring (the /v2/fs/* calls above) — the TUI's
+        // Global tab. Not recorded into itself (see activity::global_endpoint).
+        .route("/v2/activity", get(v2::sessions::global_activity))
         // Record session-scoped requests into the session's activity ring
         // (issue #3). Layered before with_state consumes `state`.
         .layer(middleware::from_fn_with_state(
